@@ -12,14 +12,14 @@ from scipy.optimize import linprog
 import folium
 from streamlit_folium import st_folium
 
-# Gemini (optional; deterministic fallback if not configured)
+# Optional LLM (Gemini) for narrative; app works without it
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MUST be the first Streamlit command
+# Streamlit MUST start with set_page_config
 # ──────────────────────────────────────────────────────────────────────────────
 PAGE_TITLE = "TMS Agent — Control Tower (Gemini)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
@@ -27,23 +27,21 @@ st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 # ──────────────────────────────────────────────────────────────────────────────
 # App constants
 # ──────────────────────────────────────────────────────────────────────────────
-DATA_PATH = os.path.join("data", "base_case.xlsx")  # your Excel path in repo
+DATA_PATH = os.path.join("data", "base_case.xlsx")
 PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
 ]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# State
-# ──────────────────────────────────────────────────────────────────────────────
 def ensure_state():
     ss = st.session_state
-    ss.setdefault("case_loaded_from", None)  # "repo" or "upload"
-    ss.setdefault("boot", None)
-    ss.setdefault("phase", "idle")  # idle, baseline, incident1, incident2, incident3
+    ss.setdefault("case_loaded_from", None)   # "repo" | "upload"
+    ss.setdefault("case", None)               # parsed inputs
+    ss.setdefault("base", None)               # baseline solve payload
+    ss.setdefault("maps", {})                 # map cache
     ss.setdefault("payloads", {"0": None, "1": None, "2": None, "3": None})
-    ss.setdefault("maps", {"0": None, "1": None, "2": None, "3": None})
     ss.setdefault("explanations", {"0": None, "1": None, "2": None, "3": None})
+    ss.setdefault("phase", "idle")            # idle|baseline|incident1|incident2|incident3
     ss.setdefault("gem_model", "gemini-1.5-pro")
     ss.setdefault("gem_temperature", 0.1)
     ss.setdefault("gem_max_tokens", 300)
@@ -51,37 +49,9 @@ def ensure_state():
 ensure_state()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Excel parsing tailored to YOUR workbook
-# Relevant sheets:
-#   - Customers                (IDs; may or may not have lat/lon)
-#   - Customer Product Data    (demand)
-#   - Location                 (all site coordinates)
-#   - Transport Cost           (lanes)
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _norm(s): return str(s).strip().lower()
-
-def load_excel_from_repo_or_upload() -> dict:
-    """Load /data/base_case.xlsx or allow user upload."""
-    if os.path.exists(DATA_PATH):
-        try:
-            xls = pd.ExcelFile(DATA_PATH)
-            return {"source": "repo", "xls": xls}
-        except Exception as e:
-            st.error(f"Failed to open {DATA_PATH}: {e}")
-
-    up = st.file_uploader("Upload your base_case.xlsx", type=["xlsx"])
-    if up is not None:
-        try:
-            xls = pd.ExcelFile(io.BytesIO(up.read()))
-            return {"source": "upload", "xls": xls}
-        except Exception as e:
-            st.error(f"Failed to read uploaded file: {e}")
-
-    st.error(
-        "Data file missing. Add `data/base_case.xlsx` to the repo "
-        "or upload the Excel above."
-    )
-    st.stop()
 
 def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool=False) -> Optional[str]:
     cols = list(df.columns)
@@ -95,206 +65,192 @@ def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool=False) -> 
                 return c
     return None
 
+def haversine_km(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, asin, sqrt
+    R=6371.0
+    dlat=radians(lat2-lat1)
+    dlon=radians(lon2-lon1)
+    a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    return 2*R*asin(sqrt(a))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Load Excel & parse your schema (AIMMS demo workbook)
+# ──────────────────────────────────────────────────────────────────────────────
+def load_excel() -> pd.ExcelFile:
+    # Try repo file first
+    if os.path.exists(DATA_PATH):
+        return pd.ExcelFile(DATA_PATH)
+
+    # Otherwise allow upload
+    up = st.file_uploader("Upload base_case.xlsx", type=["xlsx"])
+    if up is None:
+        st.error("Data file missing. Add `data/base_case.xlsx` to the repo or upload it here.")
+        st.stop()
+    return pd.ExcelFile(io.BytesIO(up.read()))
+
 def read_case() -> dict:
-    bundle = load_excel_from_repo_or_upload()
-    xls = bundle["xls"]
-    st.session_state["case_loaded_from"] = bundle["source"]
+    xls = load_excel()
+    st.session_state["case_loaded_from"] = "repo" if os.path.exists(DATA_PATH) else "upload"
 
-    # Helper: robust sheet getter by fuzzy name
-    def get_sheet(*candidates) -> Optional[pd.DataFrame]:
-        name_map = { _norm(n): n for n in xls.sheet_names }
-        for cand in candidates:
-            key = _norm(cand)
-            if key in name_map:
-                df = pd.read_excel(xls, name_map[key])
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-        # substring fallback
-        for nm in xls.sheet_names:
-            if any(_norm(cand) in _norm(nm) for cand in candidates):
-                df = pd.read_excel(xls, nm)
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-        return None
+    # Load required sheets
+    customers_df = pd.read_excel(xls, "Customers")
+    demand_df    = pd.read_excel(xls, "Customer Product Data")
+    loc_df       = pd.read_excel(xls, "Location")
+    lanes_tpl    = pd.read_excel(xls, "Transport Cost")
+    groups_df    = pd.read_excel(xls, "Location Groups")
+    supp_prod    = pd.read_excel(xls, "Supplier Product")
+    wh_df        = pd.read_excel(xls, "Warehouse")  # used to classify DCs (optional)
 
-    customers_df = get_sheet("Customers")
-    demand_df    = get_sheet("Customer Product Data", "CustomerProduct", "Cust Prod")
-    loc_df       = get_sheet("Location", "Locations")
-    lanes_df     = get_sheet("Transport Cost", "Transportation", "Transport")
+    # Normalize columns
+    for df in (customers_df, demand_df, loc_df, lanes_tpl, groups_df, supp_prod, wh_df):
+        df.columns = [str(c).strip() for c in df.columns]
 
-    if customers_df is None or demand_df is None or loc_df is None or lanes_df is None:
-        st.error("Could not find required sheets (Customers, Customer Product Data, Location, Transport Cost).")
-        st.stop()
-
-    # --- Identify key columns (robust, with fallbacks)
-    # Customers: ID (required), lat/lon (optional)
-    cust_id_col = _find_col(customers_df, ["customer","customerid","id","name"])
-    # optional reference to Location table
-    cust_loc_ref_col = _find_col(customers_df, ["location","site","node"])
-
-    cust_lat_col = _find_col(customers_df, ["lat"], contains=True)  # accepts 'Latitude', 'lat', etc.
-    cust_lon_col = _find_col(customers_df, ["lon","lng","long"], contains=True)
-
+    # Customers
+    cust_id_col = _find_col(customers_df, ["customer","name","id"])
     if not cust_id_col:
-        st.error("Customers sheet must contain an ID/Name column (e.g., 'Customer', 'CustomerID', 'Name').")
+        st.error("Customers sheet must contain a Customer/Name/ID column.")
         st.stop()
+    customers = customers_df[cust_id_col].dropna().astype(str).tolist()
 
-    # Demand: Customer, Product, Demand
-    dem_cust_col = _find_col(demand_df, ["customer","customerid","id","name"])
+    # Demand
+    dem_cust_col = _find_col(demand_df, ["customer","name","id"])
     dem_prod_col = _find_col(demand_df, ["product"])
     dem_qty_col  = _find_col(demand_df, ["demand","qty","quantity","volume"])
     if not all([dem_cust_col, dem_prod_col, dem_qty_col]):
-        st.error("Customer Product Data sheet must contain Customer, Product, Demand columns.")
+        st.error("Customer Product Data must contain Customer, Product, Demand.")
         st.stop()
+    dem = demand_df[[dem_cust_col, dem_prod_col, dem_qty_col]].copy()
+    dem.columns = ["customer","product","demand"]
+    dem["demand"] = pd.to_numeric(dem["demand"], errors="coerce").fillna(0.0)
+    demand = dem.groupby(["customer","product"])["demand"].sum().reset_index()
 
-    # Location: Location ID, lat, lon
-    loc_id_col = _find_col(loc_df, ["location","id","name","site"])
-    loc_lat_col = _find_col(loc_df, ["lat"], contains=True)
-    loc_lon_col = _find_col(loc_df, ["lon","lng","long"], contains=True)
-    if not all([loc_id_col, loc_lat_col, loc_lon_col]):
-        st.error("Location sheet must contain Location ID/Name and Latitude/Longitude.")
+    # Locations (lat/lon)
+    loc_id_col = _find_col(loc_df, ["location","name","id"])
+    lat_col = _find_col(loc_df, ["lat"], contains=True)
+    lon_col = _find_col(loc_df, ["lon","lng","long"], contains=True)
+    if not all([loc_id_col, lat_col, lon_col]):
+        st.error("Location sheet must contain Location, Latitude, Longitude.")
         st.stop()
+    loc = loc_df[[loc_id_col, lat_col, lon_col]].dropna(subset=[loc_id_col]).copy()
+    loc.columns = ["id","lat","lon"]
+    coord = {r["id"]: {"lat": float(r["lat"]), "lon": float(r["lon"])} for _, r in loc.iterrows()}
 
-    # Lanes: Source, Destination, Product, Capacity, Cost
-    lanes_src_col = _find_col(lanes_df, ["source","src","from"])
-    lanes_dst_col = _find_col(lanes_df, ["destination","dest","dst","to"])
-    lanes_pr_col  = _find_col(lanes_df, ["product"])
-    lanes_cap_col = _find_col(lanes_df, ["capacity","cap"])
-    lanes_cost_col= _find_col(lanes_df, ["cost","unit cost","cost_per_unit"], contains=True)
-    if not all([lanes_src_col, lanes_dst_col, lanes_pr_col, lanes_cap_col, lanes_cost_col]):
-        st.error("Transport Cost sheet must contain Source, Destination, Product, Capacity, and Cost columns.")
+    # Location groups (FG/DC)
+    if "Location" not in groups_df.columns or "SubLocation" not in groups_df.columns:
+        st.error("Location Groups sheet must contain columns Location and SubLocation.")
         st.stop()
+    FG = set(groups_df[groups_df["Location"]=="FG"]["SubLocation"].dropna().astype(str))
+    DC = set(groups_df[groups_df["Location"]=="DC"]["SubLocation"].dropna().astype(str))
 
-    # --- Build nodes
-    customers_df = customers_df.dropna(subset=[cust_id_col]).copy()
-    loc_df = loc_df.dropna(subset=[loc_id_col]).copy()
+    # Suppliers & supply by product at FG locations
+    sp = supp_prod.copy()
+    sp = sp.rename(columns={"Location":"supplier"})
+    if not {"supplier","Product"}.issubset(set(sp.columns)):
+        st.error("Supplier Product sheet must include Location (or supplier) and Product.")
+        st.stop()
+    cap_col = _find_col(sp, ["Maximum Capacity","Capacity","Cap"])
+    if cap_col is None:
+        # safe fallback = 0 (will force slacks if nothing else)
+        sp["Maximum Capacity"] = 0.0
+        cap_col = "Maximum Capacity"
+    sp["supply"] = pd.to_numeric(sp[cap_col], errors="coerce").fillna(0.0)
+    if "Available" in sp.columns:
+        sp["avail"] = pd.to_numeric(sp["Available"], errors="coerce").fillna(1.0)
+        sp = sp[sp["avail"] > 0]
+    sp = sp[["supplier","Product","supply"]].rename(columns={"Product":"product"})
+    sp["supplier"] = sp["supplier"].astype(str)
+    sp = sp[sp["supplier"].isin(FG)]
+    supply = sp.groupby(["supplier","product"])["supply"].sum().reset_index()
 
-    # Start with customers minimal frame
-    cust_nodes = customers_df[[cust_id_col]].copy()
-    cust_nodes.columns = ["id"]
-    cust_nodes["kind"] = "customer"
+    # Products set
+    products = sorted(demand["product"].dropna().astype(str).unique().tolist())
 
-    # Merge coordinates into customers:
-    # 1) If Customers already has lat/lon, use them
-    if cust_lat_col and cust_lon_col:
-        cust_nodes = cust_nodes.merge(
-            customers_df[[cust_id_col, cust_lat_col, cust_lon_col]].rename(
-                columns={cust_id_col: "id", cust_lat_col: "lat", cust_lon_col: "lon"}
-            ),
-            on="id", how="left"
-        )
-    else:
-        # 2) Try exact ID match against Location
-        coords_from_loc = loc_df[[loc_id_col, loc_lat_col, loc_lon_col]].rename(
-            columns={loc_id_col:"id", loc_lat_col:"lat", loc_lon_col:"lon"}
-        )
-        cust_nodes = cust_nodes.merge(coords_from_loc, on="id", how="left")
+    # Template transport cost: use two rows (FG→DC and DC→City)
+    # If missing, fallback to defaults: cost_per_distance=1/2; cost_per_uom=5/10
+    def _tpl_row(fr, to):
+        hit = lanes_tpl[(lanes_tpl.get("From Location")==fr) & (lanes_tpl.get("To Location")==to)]
+        if len(hit) > 0:
+            r = hit.iloc[0].to_dict()
+            return {
+                "cpd": float(r.get("Cost per Distance", 1.0) or 1.0),
+                "cpu": float(r.get("Cost Per UOM", 0.0) or 0.0)
+            }
+        return {"cpd": 1.0 if fr=="FG" else 2.0, "cpu": 5.0 if fr=="FG" else 10.0}
 
-        # 3) If still missing, try Customers' Location/Site reference → Location table
-        if cust_loc_ref_col:
-            ref_map = customers_df[[cust_id_col, cust_loc_ref_col]].rename(
-                columns={cust_id_col:"id", cust_loc_ref_col:"loc_ref"}
-            )
-            ref_coords = coords_from_loc.rename(columns={"id":"loc_ref"})
-            cust_nodes = cust_nodes.merge(ref_map, on="id", how="left")
-            cust_nodes = cust_nodes.merge(ref_coords, on="loc_ref", how="left", suffixes=("","_from_ref"))
-            # fill missing lat/lon from ref
-            cust_nodes["lat"] = cust_nodes["lat"].fillna(cust_nodes.pop("lat_from_ref"))
-            cust_nodes["lon"] = cust_nodes["lon"].fillna(cust_nodes.pop("lon_from_ref"))
-            cust_nodes.drop(columns=["loc_ref"], inplace=True)
+    tpl_fg_dc = _tpl_row("FG","DC")
+    tpl_dc_ct = _tpl_row("DC","City")
 
-    # Non-customer nodes (suppliers/DCs) directly from Location
-    loc_nodes = loc_df[[loc_id_col, loc_lat_col, loc_lon_col]].copy()
-    loc_nodes.columns = ["id","lat","lon"]
+    # Build nodes: combine FG, DC, and customers (only those with coordinates)
+    nodes = []
+    # DC list: from groups and/or Warehouse sheet
+    warehouses = set(wh_df.get("Location", pd.Series(dtype=str)).dropna().astype(str)) | DC
+    # Suppliers = FG
+    for s in FG:
+        if s in coord:
+            nodes.append({"id": s, "lat": coord[s]["lat"], "lon": coord[s]["lon"], "kind": "supplier"})
+    for d in warehouses:
+        if d in coord:
+            nodes.append({"id": d, "lat": coord[d]["lat"], "lon": coord[d]["lon"], "kind": "dc"})
+    for c in customers:
+        if c in coord:
+            nodes.append({"id": c, "lat": coord[c]["lat"], "lon": coord[c]["lon"], "kind": "customer"})
+        else:
+            # still include as node without coords (will be hidden on map)
+            nodes.append({"id": c, "lat": None, "lon": None, "kind": "customer"})
+    nodes_df = pd.DataFrame(nodes).drop_duplicates(subset=["id"])
 
-    def infer_kind(node_id: str) -> str:
-        nid = str(node_id).lower()
-        if "sup" in nid or "supplier" in nid:
-            return "supplier"
-        if "wh" in nid or "dc" in nid or "ware" in nid:
-            return "dc"
-        return "dc"  # safe default
-    loc_nodes["kind"] = loc_nodes["id"].apply(infer_kind)
+    # Build lanes programmatically:
+    #  - For each FG -> DC (all pairs), add per-product lane
+    #    capacity limited by supply at FG/product (shared across outgoing lanes via capacity = supply;
+    #    feasibility ensured by DC->City "fat" caps)
+    #  - For each DC -> City (all pairs), add per-product lane with big capacity (demand-driven)
+    lanes = []
+    for s in FG:
+        if s not in coord: continue
+        for d in warehouses:
+            if d not in coord: continue
+            dist = haversine_km(coord[s]["lat"], coord[s]["lon"], coord[d]["lat"], coord[d]["lon"])
+            for p in products:
+                sup_p = float(supply[(supply["supplier"]==s) & (supply["product"]==p)]["supply"].sum())
+                cap = sup_p if sup_p > 0 else 0.0
+                cost = tpl_fg_dc["cpu"] + tpl_fg_dc["cpd"] * dist
+                lanes.append({"src": s, "dst": d, "product": p, "capacity": cap, "cost_per_unit": cost})
 
-    # Combine & dedupe
-    nodes_df = pd.concat([cust_nodes, loc_nodes], ignore_index=True).drop_duplicates(subset=["id"])
+    for d in warehouses:
+        if d not in coord: continue
+        for c in customers:
+            if c not in coord: continue
+            dist = haversine_km(coord[d]["lat"], coord[d]["lon"], coord[c]["lat"], coord[c]["lon"])
+            for p in products:
+                dem_p = float(demand[(demand["customer"]==c) & (demand["product"]==p)]["demand"].sum())
+                cap = (dem_p * 2.0) + 1e6  # generous per-lane cap to avoid binding here
+                cost = tpl_dc_ct["cpu"] + tpl_dc_ct["cpd"] * dist
+                lanes.append({"src": d, "dst": c, "product": p, "capacity": cap, "cost_per_unit": cost})
 
-    # --- Demand
-    demand = demand_df[[dem_cust_col, dem_prod_col, dem_qty_col]].copy()
-    demand.columns = ["customer","product","demand"]
-    demand["demand"] = pd.to_numeric(demand["demand"], errors="coerce").fillna(0.0)
-
-    # --- Products
-    products = sorted(set(demand["product"].unique()) | set(lanes_df[lanes_pr_col].unique()))
-
-    # --- Lanes
-    lanes = lanes_df[[lanes_src_col, lanes_dst_col, lanes_pr_col, lanes_cap_col, lanes_cost_col]].copy()
-    lanes.columns = ["src","dst","product","capacity","cost_per_unit"]
-    lanes["capacity"] = pd.to_numeric(lanes["capacity"], errors="coerce").fillna(0.0)
-    lanes["cost_per_unit"] = pd.to_numeric(lanes["cost_per_unit"], errors="coerce").fillna(0.0)
-
-    # --- Synthetic supply, balanced by total product demand across available sources
-    total_demand_per_p = demand.groupby("product")["demand"].sum().to_dict()
-
-    # identify customer ids to avoid treating them as sources
-    customer_ids = set(customers_df[cust_id_col].astype(str))
-
-    sources_by_p = {}
-    for p in products:
-        mask = (lanes["product"] == p)
-        srcs = sorted(set(lanes.loc[mask, "src"].astype(str)))
-        srcs = [s for s in srcs if s not in customer_ids]
-        if not srcs:
-            # fallback: any non-customer location IDs
-            srcs = list(loc_nodes["id"].astype(str))
-        sources_by_p[p] = srcs
-
-    supply_rows = []
-    for p in products:
-        tot = float(total_demand_per_p.get(p, 0.0))
-        srcs = sources_by_p[p]
-        share = (tot / max(1, len(srcs))) if tot > 0 else 0.0
-        for s in srcs:
-            supply_rows.append({"supplier": s, "product": p, "supply": share})
-    supply = pd.DataFrame(supply_rows)
-
-    # Friendly note if some customers still lack coords (solver ok; map will skip)
-    missing_coords = nodes_df.query("kind=='customer' and (lat.isna() or lon.isna())")["id"].tolist()
-    if missing_coords:
-        st.warning(f"{len(missing_coords)} customer(s) have no coordinates in Customers/Location. They’ll be solved but hidden on the map.")
-
+    # Final case dict
     return {
         "nodes": nodes_df,
-        "demand": demand,
-        "supply": supply,
-        "lanes": lanes,
+        "demand": demand,             # columns: customer, product, demand
+        "supply": supply,             # columns: supplier, product, supply
+        "lanes": pd.DataFrame(lanes), # columns: src, dst, product, capacity, cost_per_unit
         "products": products
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optimizer (LP with slacks)
+# Optimizer (LP with shortage/disposal slacks)
 # ──────────────────────────────────────────────────────────────────────────────
 def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
-    """
-    Balanced min-cost multi-commodity flow with shortage/disposal slacks (BIGM).
-    shock:
-      - {"type":"lane_cap","src":...,"dst":...,"product":<opt>,"new_capacity":...}
-      - {"type":"demand_spike","customer":...,"pct":0.25}
-      - {"type":"express_lane","src":...,"dst":...,"product":...,"capacity":...,"cost_per_unit":...}
-    """
-    nodes = case["nodes"].copy()
+    nodes = case["nodes"]
     demand_df = case["demand"].copy()
     supply_df = case["supply"].copy()
     lanes_df  = case["lanes"].copy()
 
-    products = sorted(set(demand_df["product"].unique()) | set(supply_df["product"].unique()))
-
-    # Apply shock
+    # Apply incident shock
     if shock:
         t = shock.get("type")
         if t == "lane_cap":
             cond = (lanes_df["src"] == shock["src"]) & (lanes_df["dst"] == shock["dst"])
-            if "product" in shock and pd.notna(shock["product"]):
+            if shock.get("product") is not None:
                 cond &= (lanes_df["product"] == shock["product"])
             lanes_df.loc[cond, "capacity"] = float(shock["new_capacity"])
         elif t == "demand_spike":
@@ -307,7 +263,7 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
             }
             lanes_df = pd.concat([lanes_df, pd.DataFrame([newrow])], ignore_index=True)
 
-    # Variables x[(src,dst,product)]
+    # Decision vars x[src,dst,product]
     lanes = lanes_df[["src","dst","product","capacity","cost_per_unit"]].to_dict(orient="records")
     var_keys = [(l["src"], l["dst"], l["product"]) for l in lanes]
     vidx = {k:i for i,k in enumerate(var_keys)}
@@ -316,8 +272,8 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     # Slack vars: disposal per supplier/product, shortage per customer/product
     cust_prod = sorted({(r["customer"], r["product"]) for _, r in demand_df.iterrows()})
     supp_prod = sorted({(r["supplier"], r["product"]) for _, r in supply_df.iterrows()})
-    sp_index = {k: n_x + i for i, k in enumerate(supp_prod)}  # disposal
-    sh_index = {k: n_x + len(supp_prod) + i for i, k in enumerate(cust_prod)}  # shortage
+    sp_index = {k: n_x + i for i, k in enumerate(supp_prod)}                 # disposal
+    sh_index = {k: n_x + len(sp_index) + i for i, k in enumerate(cust_prod)} # shortage
     n_vars = n_x + len(sp_index) + len(sh_index)
 
     # Objective
@@ -334,7 +290,7 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     # Constraints
     A_eq = []; b_eq = []
 
-    # Supply balance: outflow + disposal = supply
+    # Supply balance: sum outflow + disposal = supply
     for s,p in supp_prod:
         row = np.zeros(n_vars)
         for (src,dst,pr), i in vidx.items():
@@ -344,7 +300,7 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
         sup_val = float(supply_df[(supply_df["supplier"]==s) & (supply_df["product"]==p)]["supply"].sum())
         A_eq.append(row); b_eq.append(sup_val)
 
-    # Demand balance: inflow + shortage = demand
+    # Demand balance: sum inflow + shortage = demand
     for cst,p in cust_prod:
         row = np.zeros(n_vars)
         for (src,dst,pr), i in vidx.items():
@@ -373,7 +329,6 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
         method="highs"
     )
 
-    used_slacks = False
     total_shortage = 0.0
     total_disposal = 0.0
     flows = []
@@ -389,21 +344,16 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
             total_disposal += float(x[i])
         for (cst,p), i in sh_index.items():
             total_shortage += float(x[i])
-        used_slacks = (total_disposal > 1e-6) or (total_shortage > 1e-6)
         objective = float(res.fun)
-    else:
-        used_slacks = True  # show as fallback used
 
-    # Node list for map
+    # Nodes for map
     nrecs = []
-    for _, r in case["nodes"].iterrows():
-        lt = r.get("lat")
-        ln = r.get("lon")
+    for _, r in nodes.iterrows():
         nrecs.append({
             "id": str(r.get("id")),
             "kind": str(r.get("kind")),
-            "lat": float(lt) if pd.notna(lt) else None,
-            "lon": float(ln) if pd.notna(ln) else None
+            "lat": float(r["lat"]) if pd.notna(r["lat"]) else None,
+            "lon": float(r["lon"]) if pd.notna(r["lon"]) else None
         })
 
     products_list = case.get("products", sorted(set([f["product"] for f in flows])))
@@ -411,13 +361,13 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     return {
         "ok": bool(res.success),
         "objective_cost": objective,
-        "used_slacks": used_slacks,
+        "used_slacks": (total_disposal > 1e-6) or (total_shortage > 1e-6),
         "total_shortage": total_shortage,
         "total_disposal": total_disposal,
         "nodes": nrecs,
         "products": products_list,
         "flows": flows,
-        "currency": "INR",
+        "currency": "EUR",
         "flow_unit": "units"
     }
 
@@ -452,6 +402,7 @@ def incident_1(case: dict, prev: dict) -> dict:
 def incident_2(case: dict, prev: dict) -> dict:
     if not prev.get("flows"):
         return {"title":"Incident 2","objective_before":prev.get("objective_cost"),"objective_after":prev.get("objective_cost"),"flows_after":prev.get("flows",[])}
+    # choose the customer with largest inbound flow previously
     dest_tot = {}
     for f in prev["flows"]:
         dest_tot[f["dst"]] = dest_tot.get(f["dst"], 0.0) + f["flow"]
@@ -477,7 +428,7 @@ def incident_3(case: dict, prev: dict) -> dict:
     top = sorted(prev["flows"], key=lambda x: x["flow"], reverse=True)[0]
     src, dst, pr = top["src"], top["dst"], top["product"]
     shock = {"type": "express_lane", "src": src, "dst": dst, "product": pr,
-             "capacity": max(top["flow"]*0.5, 1.0), "cost_per_unit": 0.75}
+             "capacity": max(top["flow"]*0.5, 1.0), "cost_per_unit": 0.5}
     before = prev["objective_cost"]
     aft = solve_min_cost_flow(case, shock)
     return {
@@ -498,7 +449,7 @@ def incident_3(case: dict, prev: dict) -> dict:
 def _center_latlon(nodes: List[Dict]) -> Tuple[float,float]:
     lats = [n.get("lat") for n in nodes if n.get("lat") is not None]
     lons = [n.get("lon") for n in nodes if n.get("lon") is not None]
-    if not lats or not lons: return (20.5937, 78.9629)
+    if not lats or not lons: return (20.5937, 78.9629)  # India fallback
     return (sum(lats)/len(lats), sum(lons)/len(lons))
 
 def _product_color_map(products: List[str]) -> Dict[str,str]:
@@ -507,7 +458,7 @@ def _product_color_map(products: List[str]) -> Dict[str,str]:
 def _node_by_id(nodes: List[Dict]) -> Dict[str,Dict]:
     return {n["id"]: n for n in nodes}
 
-def _flow_weight_scaler(flows: List[Dict], min_w: float = 0.6, max_w: float = 3.0):
+def _flow_weight_scaler(flows: List[Dict], min_w: float = 0.6, max_w: float = 2.2):
     vals = sorted(float(f.get("flow", 0.0)) for f in flows if f.get("flow", 0.0) > 0)
     if not vals: return lambda x: min_w
     p90 = vals[min(int(0.9*(len(vals)-1)), len(vals)-1)]
@@ -525,7 +476,7 @@ def build_map(nodes: List[Dict], flows: List[Dict], products: List[str]) -> foli
 
     # nodes
     for n in nodes:
-        if n.get("lat") is None or n.get("lon") is None:  # skip nodes without coords
+        if n.get("lat") is None or n.get("lon") is None:
             continue
         kind = n.get("kind","")
         color = "#198754" if kind not in ("supplier","dc") else ("#6f42c1" if kind=="supplier" else "#0d6efd")
@@ -562,7 +513,7 @@ def show_flows_table(flows: list[dict], caption="Solved flows"):
     st.caption(caption)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gemini explanation (guardrailed) with deterministic fallback
+# LLM Narrative (Gemini) with deterministic fallback & light guardrails
 # ──────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a supply-chain control-tower analyst. Domain: freight TMS (not passengers).\n"
@@ -623,7 +574,7 @@ def gemini_explain(idx: int, payload: dict) -> str:
             "total_disposal": payload.get("total_disposal"),
             "lane": payload.get("lane"),
             "customer": payload.get("customer"),
-            "units": {"currency": payload.get("currency","INR"), "flow_unit": payload.get("flow_unit","units")}
+            "units": {"currency": payload.get("currency","EUR"), "flow_unit": payload.get("flow_unit","units")}
         }
         prompt = f"USER JSON:\n{json.dumps(ctx, ensure_ascii=False)}"
         resp = model.generate_content(
@@ -631,6 +582,7 @@ def gemini_explain(idx: int, payload: dict) -> str:
             generation_config={"temperature": temperature, "max_output_tokens": max_tokens}
         )
         text = (resp.text or "").strip()
+        # simple domain guard
         if any(w in text.lower() for w in ["passenger", "ridership", "ticket"]):
             return deterministic_explanation(idx, payload)
         return text if text else deterministic_explanation(idx, payload)
@@ -661,12 +613,12 @@ with agent:
     st.subheader("Agent Narrative")
 
 st.divider()
-col1, col2 = st.columns([1,1])
-with col1:
+c1, c2 = st.columns([1,1])
+with c1:
     if st.button("🚀 Bootstrap baseline (solve from Excel)"):
         base, case = build_baseline()
         st.session_state["case"] = case
-        st.session_state["boot"] = base
+        st.session_state["base"] = base
         st.session_state["payloads"]["0"] = {
             "title": "Baseline",
             "objective_before": base["objective_cost"],
@@ -678,45 +630,45 @@ with col1:
         st.session_state["maps"]["0"] = build_map(base["nodes"], base["flows"], base["products"])
         st.success(f"Baseline solved (data source: {st.session_state['case_loaded_from']}).")
 
-with col2:
+with c2:
     if st.button("🚨 Run Incident 1 now"):
-        if not st.session_state.get("boot"):
+        if not st.session_state.get("base"):
             st.warning("Run baseline first.")
         else:
             case = st.session_state["case"]
-            resp1 = incident_1(case, st.session_state["payloads"]["0"])
+            prev = st.session_state["payloads"]["0"]
+            resp1 = incident_1(case, prev)
             st.session_state["payloads"]["1"] = resp1
             st.session_state["phase"] = "incident1"
-            st.session_state["maps"]["1"] = build_map(st.session_state["boot"]["nodes"], resp1.get("flows_after",[]), st.session_state["boot"]["products"])
+            st.session_state["maps"]["1"] = build_map(st.session_state["base"]["nodes"], resp1.get("flows_after",[]), st.session_state["base"]["products"])
             ensure_explanation(1, resp1)
             st.success("Incident 1 executed.")
 
-# Sidebar incident triggers
 with st.sidebar:
     st.divider()
     st.caption("Run additional incidents")
     if st.button("▶️ Incident 2 (demand surge)"):
-        if not st.session_state.get("boot"):
+        if not st.session_state.get("base"):
             st.warning("Run baseline first.")
         else:
             case = st.session_state["case"]
-            base_or_last = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
-            resp2 = incident_2(case, base_or_last)
+            prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+            resp2 = incident_2(case, prev)
             st.session_state["payloads"]["2"] = resp2
             st.session_state["phase"] = "incident2"
-            st.session_state["maps"]["2"] = build_map(st.session_state["boot"]["nodes"], resp2.get("flows_after",[]), st.session_state["boot"]["products"])
+            st.session_state["maps"]["2"] = build_map(st.session_state["base"]["nodes"], resp2.get("flows_after",[]), st.session_state["base"]["products"])
             ensure_explanation(2, resp2)
             st.success("Incident 2 executed.")
     if st.button("▶️ Incident 3 (strategic express lane)"):
-        if not st.session_state.get("boot"):
+        if not st.session_state.get("base"):
             st.warning("Run baseline first.")
         else:
             case = st.session_state["case"]
-            base_or_last = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
-            resp3 = incident_3(case, base_or_last if base_or_last else st.session_state["payloads"]["0"])
+            prev = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+            resp3 = incident_3(case, prev)
             st.session_state["payloads"]["3"] = resp3
             st.session_state["phase"] = "incident3"
-            st.session_state["maps"]["3"] = build_map(st.session_state["boot"]["nodes"], resp3.get("flows_after",[]), st.session_state["boot"]["products"])
+            st.session_state["maps"]["3"] = build_map(st.session_state["base"]["nodes"], resp3.get("flows_after",[]), st.session_state["base"]["products"])
             ensure_explanation(3, resp3)
             st.success("Incident 3 executed.")
 
@@ -742,8 +694,8 @@ with agent:
         st.caption("Ready. Solve baseline, then run incidents.")
 
 # Baseline section
-if st.session_state.get("boot"):
-    base = st.session_state["boot"]
+if st.session_state.get("base"):
+    base = st.session_state["base"]
     st.subheader("Baseline")
     st.caption(f"Products: {', '.join(base.get('products', []))} | Nodes: {len(base.get('nodes', []))} | Flows: {len(base.get('flows', []))}")
     with st.container(border=True):
