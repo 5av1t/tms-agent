@@ -212,7 +212,7 @@ def read_case() -> dict:
     supply = sp.groupby(["supplier","product"])["supply"].sum().reset_index()
 
     # Products
-    products = sorted(demand["product"].dropna().astype(str).unique().tolist()
+    products = sorted(demand["product"].dropna().astype(str).unique().tolist())
 
     # Transport cost templates
     def _tpl_row(fr, to):
