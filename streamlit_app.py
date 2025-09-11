@@ -86,8 +86,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
     R=6371.0
     dlat=radians(lat2-lat1)
-    dlon=radians(l2:=lon2-lon1)
-    dlon=radians(l2)
+    dlon=radians(lon2-lon1)
     a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     return 2*R*asin(sqrt(a))
 
@@ -99,13 +98,13 @@ def ensure_state():
     # Data & solves
     ss.setdefault("case_loaded_from", None)
     ss.setdefault("case", None)                  # parsed inputs
+    ss.setdefault("total_demand", None)          # sum of all customer demands
     ss.setdefault("base", None)                  # baseline solve payload
     ss.setdefault("maps", {})                    # cached folium maps
     # Incidents & agent state machine
     ss.setdefault("phase", "idle")               # idle|baseline_ready|thinking|acting|evaluating|complete
     ss.setdefault("is_running", False)
     ss.setdefault("current_incident", None)      # {"id": 1|2|3, "label": "..."}
-    ss.setdefault("incident_queue", [])          # list of incident ids waiting
     ss.setdefault("tick_count", 0)
     ss.setdefault("next_tick_at", None)          # epoch seconds
     ss.setdefault("logs", {"1": [], "2": [], "3": []})
@@ -126,14 +125,14 @@ def schedule_next_tick():
     st.session_state["next_tick_at"] = time.time() + TICK_INTERVAL
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Load Excel & parse (AIMMS-like schema)
+# Load & parse data (AIMMS-like workbook schema)
 # ──────────────────────────────────────────────────────────────────────────────
 def load_excel() -> pd.ExcelFile:
     if os.path.exists(DATA_PATH):
         return pd.ExcelFile(DATA_PATH)
-    up = st.file_uploader("Upload base_case.xlsx", type=["xlsx"])
+    up = st.file_uploader("Upload data file", type=["xlsx"])
     if up is None:
-        st.error("Data file missing. Add `data/base_case.xlsx` to the repo or upload it here.")
+        st.error("Data file missing. Add `data/base_case.xlsx` to the app or upload it here.")
         st.stop()
     return pd.ExcelFile(io.BytesIO(up.read()))
 
@@ -168,6 +167,7 @@ def read_case() -> dict:
     dem.columns = ["customer","product","demand"]
     dem["demand"] = pd.to_numeric(dem["demand"], errors="coerce").fillna(0.0)
     demand = dem.groupby(["customer","product"])["demand"].sum().reset_index()
+    st.session_state["total_demand"] = float(demand["demand"].sum())
 
     # Locations
     loc_id_col = _find_col(loc_df, ["location","name","id"])
@@ -241,7 +241,7 @@ def read_case() -> dict:
         if s not in coord: continue
         for d in warehouses:
             if d not in coord: continue
-            dist = d_latlon(s, d); 
+            dist = d_latlon(s, d)
             if dist is None: continue
             for p in products:
                 sup_p = float(supply[(supply["supplier"]==s) & (supply["product"]==p)]["supply"].sum())
@@ -253,7 +253,7 @@ def read_case() -> dict:
         if d not in coord: continue
         for c in customers:
             if c not in coord: continue
-            dist = d_latlon(d, c); 
+            dist = d_latlon(d, c)
             if dist is None: continue
             for p in products:
                 dem_p = float(demand[(demand["customer"]==c) & (demand["product"]==p)]["demand"].sum())
@@ -403,6 +403,91 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# KPI computation & narrative helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def compute_kpis(case: dict, payload: dict) -> dict:
+    """Compute CXO-friendly KPIs from payload + case."""
+    cost = payload.get("objective_after")
+    flows = payload.get("flows_after") or payload.get("flows") or []
+    total_flow = float(sum(num(f.get("flow")) for f in flows))
+    lanes_used = len({(f["src"], f["dst"], f["product"]) for f in flows})
+    avg_cpu = (cost / total_flow) if (cost is not None and total_flow > 0) else None
+    shortage = payload.get("total_shortage")
+    disposal = payload.get("total_disposal")
+    total_demand = st.session_state.get("total_demand")
+    fill_rate = None
+    if total_demand is not None and shortage is not None:
+        denom = max(1e-9, float(total_demand))
+        fill_rate = max(0.0, min(1.0, 1.0 - float(shortage)/denom))
+    return {
+        "total_cost": cost,
+        "total_flow_units": total_flow,
+        "lanes_used": lanes_used,
+        "avg_cost_per_unit": avg_cpu,
+        "shortage_units": shortage,
+        "fill_rate": fill_rate,
+        "disposal_units": disposal,
+        "currency": payload.get("currency", "EUR"),
+        "flow_unit": payload.get("flow_unit", "units")
+    }
+
+def kpi_explanation_md(k: dict, label: str) -> str:
+    """Plain-English explanations for CXO audience."""
+    lines = [
+        f"**{label} — KPI Summary**",
+        f"- **Total transport cost**: {fmt(k.get('total_cost'))} {k.get('currency','')}.",
+        f"- **Total shipped volume**: {fmt(k.get('total_flow_units'))} {k.get('flow_unit','')}.",
+        f"- **Lanes used**: {fmt(k.get('lanes_used'), places=0)} lanes with non-zero flow.",
+        f"- **Avg. cost per unit**: {fmt(k.get('avg_cost_per_unit'))} {k.get('currency','')}/{k.get('flow_unit','')}.",
+        f"- **Shortage volume**: {fmt(k.get('shortage_units'))} {k.get('flow_unit','')} not fulfilled.",
+        f"- **Service fill rate**: {fmt(100*(k.get('fill_rate') if k.get('fill_rate') is not None else None), places=1)}%.",
+        f"- **Disposals (waste)**: {fmt(k.get('disposal_units'))} {k.get('flow_unit','')} scrapped."
+    ]
+    lines += [
+        "",
+        "**KPI definitions**",
+        "- *Total transport cost*: Optimizer’s objective (sum of lane costs).",
+        "- *Total shipped volume*: Sum of all product flows across the network.",
+        "- *Lanes used*: Count of distinct corridors that carried any volume.",
+        "- *Avg. cost per unit*: Total cost divided by shipped volume.",
+        "- *Shortage volume*: Demand left unserved (model allows this at heavy penalty).",
+        "- *Service fill rate*: Served demand / Total demand.",
+        "- *Disposals*: Unused supply disposed (also heavily penalized).",
+    ]
+    return "\n".join(lines)
+
+def headline_one_liner(title: str, k_now: dict, k_prev: Optional[dict]) -> str:
+    """
+    A single executive-friendly sentence: What happened & so what?
+    Uses cost and fill-rate changes; mentions likely driver from title.
+    """
+    cost = k_now.get("total_cost")
+    fill = k_now.get("fill_rate")
+    cost_txt = f"total transport cost **{fmt(cost)}**" if cost is not None else "transport cost (n/a)"
+    fill_txt = f"service fill rate **{fmt(100*(fill if fill is not None else None), places=1)}%**" if fill is not None else "service (n/a)"
+
+    delta_cost = None
+    delta_fill = None
+    if k_prev:
+        if k_prev.get("total_cost") is not None and cost is not None:
+            delta_cost = cost - k_prev["total_cost"]
+        if k_prev.get("fill_rate") is not None and fill is not None:
+            delta_fill = (fill - k_prev["fill_rate"]) * 100.0
+
+    driver = title.split("—")[-1].strip() if "—" in title else title
+    parts = [f"**{title}** complete:"]
+    # cost movement
+    if delta_cost is not None:
+        parts.append(f"{'↑' if delta_cost>0 else '↓'} cost {fmt(abs(delta_cost))} vs reference;")
+    parts.append(cost_txt + ",")
+    # fill movement
+    if delta_fill is not None:
+        parts.append(f"{'↑' if delta_fill>0 else '↓'} fill {fmt(abs(delta_fill), places=1)} pp;")
+    parts.append(fill_txt + ".")
+    parts.append(f" Driver: *{driver}*.")
+    return " ".join(parts)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Incidents (deterministic action planners)
 # ──────────────────────────────────────────────────────────────────────────────
 def pick_top_lane(payload: dict) -> Optional[dict]:
@@ -471,7 +556,6 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
             else:
                 # If LLM output is odd, fall back to preference
                 order = {"lane_cap":0, "demand_spike":1, "express_lane":2}
-                # sort candidates by closeness to preferred type
                 ranked = sorted(candidates, key=lambda c: abs(order.get(c["type"], 10) - order.get(pref,0)))
                 choice = ranked[0] if ranked else (candidates[0] if candidates else {})
             reason = f"Agent selected '{choice.get('label','action')}' for Incident {iid}."
@@ -671,10 +755,10 @@ def wrap_payload_as_snapshot(payload_after: dict, title: str, before_cost: Optio
 # ──────────────────────────────────────────────────────────────────────────────
 def start_incident(iid: int):
     if st.session_state["is_running"]:
-        st.warning("Another incident is already running. Please wait for it to complete.")
+        st.warning("Another scenario is running. Please wait for it to complete.")
         return
     if not st.session_state.get("base"):
-        st.warning("Run baseline first."); return
+        st.warning("Initialize baseline first."); return
 
     labels = {1: "Incident 1 — Corridor capacity restriction",
               2: "Incident 2 — Demand surge (+25%)",
@@ -703,8 +787,8 @@ def advance_agent():
         tick = st.session_state["tick_count"]
         msg = {
             1: "Scanning top corridors and DC headroom…",
-            2: "Estimating re-route costs and shortage risk…",
-            3: "Evaluating candidate actions for this incident…",
+            2: "Estimating re-route costs and service risk…",
+            3: "Evaluating candidate interventions…",
         }.get(tick, "Analyzing…")
         log(iid, msg)
         if tick >= THINK_TICKS:
@@ -716,12 +800,12 @@ def advance_agent():
     # ACTING → run solver with chosen action
     if phase == "acting":
         case = st.session_state["case"]
+        # choose reference (previous snapshot)
         prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
         if iid == 2:
             prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
         if iid == 3:
             prev = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
-
         if not prev:
             prev = wrap_payload_as_snapshot(st.session_state["base"], "Baseline", st.session_state["base"].get("objective_cost"))
 
@@ -762,10 +846,9 @@ def advance_agent():
 
     # EVALUATING → finalize and stop
     if phase == "evaluating":
-        iid = st.session_state["current_incident"]["id"]
         st.session_state["is_running"] = False
         st.session_state["phase"] = "complete"
-        log(iid, "Done. KPIs updated. You can now start the next incident.")
+        log(iid, "Done. KPIs updated. You can now start the next scenario.")
         # no next tick scheduled
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -775,14 +858,14 @@ st.title(PAGE_TITLE)
 
 # Sidebar — Gemini settings and logs
 with st.sidebar:
-    st.subheader("Gemini (for explanations)")
-    st.caption("Add GOOGLE_API_KEY in Streamlit Secrets. If absent, deterministic narrative is used.")
+    st.subheader("Agent explanations")
+    st.caption("Add GOOGLE_API_KEY in Streamlit Secrets for Gemini. Otherwise a deterministic summary is used.")
     st.session_state["gem_model"] = st.text_input("Model", value=st.session_state.get("gem_model","gemini-1.5-pro"))
     st.session_state["gem_temperature"] = st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("gem_temperature",0.1)), 0.05)
     st.session_state["gem_max_tokens"] = st.number_input("Max tokens", 64, 2048, int(st.session_state.get("gem_max_tokens",300)), 32)
 
     st.divider()
-    st.subheader("Agent Logs")
+    st.subheader("Agent logs")
     if st.session_state["current_incident"]:
         cur = st.session_state["current_incident"]["id"]
         st.caption(f"Current: Incident {cur}")
@@ -799,13 +882,13 @@ with st.sidebar:
 st.divider()
 agent = st.container()
 with agent:
-    st.subheader("Agent Narrative")
+    st.subheader("Agent narrative")
 
-# Bootstrap / Incident controls
+# Controls
 st.divider()
 c1, c2, c3, c4 = st.columns([1,1,1,1])
 with c1:
-    if st.button("🚀 Bootstrap baseline (solve from Excel)", disabled=st.session_state["is_running"]):
+    if st.button("🚀 Initialize baseline", disabled=st.session_state["is_running"]):
         base, case = build_baseline()
         st.session_state["case"] = case
         st.session_state["base"] = base
@@ -820,9 +903,9 @@ with c1:
         st.session_state["phase"] = "baseline_ready"
         st.session_state["maps"]["0"] = build_map(base.get("nodes", []), base.get("flows", []), base.get("products", []), key_suffix="base")
         if base.get("ok"):
-            st.success(f"Baseline solved (source: {st.session_state['case_loaded_from']}). Objective {fmt(base_obj)}.")
+            st.success(f"Baseline ready. Total transport cost {fmt(base_obj)}.")
         else:
-            st.warning("Baseline infeasible. Slacks required or data incomplete. You can still run incidents to test the narrative.")
+            st.warning("Baseline infeasible. You can still run scenarios to test the agent flow.")
 
 with c2:
     st.button("▶️ Start Incident 1", key="btn_i1",
@@ -855,12 +938,17 @@ def get_payload_by_label(lbl: str) -> Optional[dict]:
         "Incident 3": st.session_state["payloads"].get("3"),
     }.get(lbl)
 
-# Agent narrative rendering
+# Agent narrative rendering — now with one-liner for non-experts
 with agent:
     ph = st.session_state["phase"]
     if ph == "baseline_ready" and st.session_state["payloads"]["0"]:
         p = st.session_state["payloads"]["0"]
-        st.write(f"**Agent**: Baseline active. Objective **{fmt(p.get('objective_after'))}**. Monitoring lanes & capacity headroom.")
+        k = compute_kpis(st.session_state["case"], p)
+        # One-liner (no previous reference for baseline)
+        st.write(f"**Agent**: Baseline ready: total transport cost **{fmt(k['total_cost'])}**, "
+                 f"service fill rate **{fmt(100*(k.get('fill_rate') if k.get('fill_rate') is not None else None), places=1)}%**. "
+                 "This is our starting point to monitor cost and service.")
+        st.markdown(kpi_explanation_md(k, "Baseline"))
     elif st.session_state["current_incident"] and st.session_state["is_running"]:
         iid = st.session_state["current_incident"]["id"]
         label = st.session_state["current_incident"]["label"]
@@ -872,17 +960,23 @@ with agent:
             3: "Selecting the best intervention…",
         }
         st.write(f"**Agent**: {steps.get(tick, 'Working…')}")
-        # Show time to next tick (calm, no flashing)
         if st.session_state["next_tick_at"]:
             remain = max(0, int(st.session_state["next_tick_at"] - time.time()))
             st.caption(f"Next update in ~{remain}s")
     elif ph == "complete" and st.session_state["current_incident"]:
         iid = st.session_state["current_incident"]["id"]
         p = st.session_state["payloads"].get(str(iid)) or {}
-        st.write(f"**Agent**: {p.get('title', f'Incident {iid}')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
-        st.markdown(st.session_state["explanations"].get(str(iid)) or "")
+        # Business KPIs & one-liner
+        k_now = compute_kpis(st.session_state["case"], p)
+        # choose reference for one-liner = selected compare snapshot
+        ref_payload = get_payload_by_label(ref_label) or st.session_state["payloads"]["0"]
+        k_prev = compute_kpis(st.session_state["case"], ref_payload) if ref_payload else None
+        st.write("**Agent**: " + headline_one_liner(p.get("title", f"Incident {iid}"), k_now, k_prev))
+        st.markdown(kpi_explanation_md(k_now, p.get("title", f"Incident {iid}")))
+        # Keep concise technical explanation too
+        st.markdown("> " + (st.session_state["explanations"].get(str(iid)) or ""))
     else:
-        st.caption("Ready. Solve baseline, then start an incident.")
+        st.caption("Ready. Initialize baseline, then start a scenario.")
 
 # Baseline section
 if st.session_state.get("base"):
@@ -907,8 +1001,8 @@ for iid in (1,2,3):
     ref_cost = ref_payload.get("objective_after") if ref_payload else None
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Objective (incident ref before)", fmt(before))
-    c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
+    c1.metric("Total cost (before)", fmt(before))
+    c2.metric("Total cost (after)", fmt(after), delta=safe_delta(after, before))
     c3.metric(f"Δ vs {ref_label}", safe_delta(after, ref_cost))
     c4.metric("Used slacks?", "Yes" if payload.get("used_slacks") else "No")
     if payload.get("lane"):
@@ -926,11 +1020,9 @@ for iid in (1,2,3):
 # ──────────────────────────────────────────────────────────────────────────────
 # FINAL: tick driver
 # ──────────────────────────────────────────────────────────────────────────────
-# If an incident is running and time has elapsed, progress the agent and rerun.
 if st.session_state["is_running"]:
     if st.session_state["next_tick_at"] and time.time() >= st.session_state["next_tick_at"]:
         advance_agent()
         if st.session_state["is_running"]:
-            # schedule next tick and re-run to render the next narration step
             schedule_next_tick()
         st.experimental_rerun()
