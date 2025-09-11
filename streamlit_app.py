@@ -25,13 +25,45 @@ PAGE_TITLE = "TMS Agent — Control Tower (Gemini)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# App constants
+# App constants & small helpers
 # ──────────────────────────────────────────────────────────────────────────────
 DATA_PATH = os.path.join("data", "base_case.xlsx")
 PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
 ]
+
+def num(x, default=0.0) -> float:
+    """Coerce possibly None/NaN to float, with default for math."""
+    try:
+        if x is None: return float(default)
+        if isinstance(x, (int, float, np.floating)): return float(x)
+        if isinstance(x, str) and x.strip()=="":
+            return float(default)
+        v = float(x)
+        if np.isnan(v): return float(default)
+        return v
+    except Exception:
+        return float(default)
+
+def fmt(x, none="—", places=2):
+    """Format number or return placeholder."""
+    if x is None: return none
+    try:
+        v = float(x)
+        if np.isnan(v): return none
+        return f"{v:,.{places}f}"
+    except Exception:
+        return none
+
+def safe_delta(after, before, none="—", places=2):
+    if after is None or before is None: return none
+    try:
+        a, b = float(after), float(before)
+        if any(map(np.isnan, [a,b])): return none
+        return f"{(a-b):+,.{places}f}"
+    except Exception:
+        return none
 
 def ensure_state():
     ss = st.session_state
@@ -74,7 +106,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2*R*asin(sqrt(a))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Load Excel & parse your schema (AIMMS demo workbook)
+# Load Excel & parse your schema (AIMMS-like demo workbook)
 # ──────────────────────────────────────────────────────────────────────────────
 def load_excel() -> pd.ExcelFile:
     # Try repo file first
@@ -99,7 +131,7 @@ def read_case() -> dict:
     lanes_tpl    = pd.read_excel(xls, "Transport Cost")
     groups_df    = pd.read_excel(xls, "Location Groups")
     supp_prod    = pd.read_excel(xls, "Supplier Product")
-    wh_df        = pd.read_excel(xls, "Warehouse")  # used to classify DCs (optional)
+    wh_df        = pd.read_excel(xls, "Warehouse")  # optional; used to classify DCs
 
     # Normalize columns
     for df in (customers_df, demand_df, loc_df, lanes_tpl, groups_df, supp_prod, wh_df):
@@ -150,7 +182,6 @@ def read_case() -> dict:
         st.stop()
     cap_col = _find_col(sp, ["Maximum Capacity","Capacity","Cap"])
     if cap_col is None:
-        # safe fallback = 0 (will force slacks if nothing else)
         sp["Maximum Capacity"] = 0.0
         cap_col = "Maximum Capacity"
     sp["supply"] = pd.to_numeric(sp[cap_col], errors="coerce").fillna(0.0)
@@ -166,45 +197,40 @@ def read_case() -> dict:
     products = sorted(demand["product"].dropna().astype(str).unique().tolist())
 
     # Template transport cost: use two rows (FG→DC and DC→City)
-    # If missing, fallback to defaults: cost_per_distance=1/2; cost_per_uom=5/10
     def _tpl_row(fr, to):
-        hit = lanes_tpl[(lanes_tpl.get("From Location")==fr) & (lanes_tpl.get("To Location")==to)]
+        if "From Location" in lanes_tpl.columns and "To Location" in lanes_tpl.columns:
+            hit = lanes_tpl[(lanes_tpl.get("From Location")==fr) & (lanes_tpl.get("To Location")==to)]
+        else:
+            hit = pd.DataFrame()
         if len(hit) > 0:
             r = hit.iloc[0].to_dict()
             return {
                 "cpd": float(r.get("Cost per Distance", 1.0) or 1.0),
                 "cpu": float(r.get("Cost Per UOM", 0.0) or 0.0)
             }
+        # defaults if template not present
         return {"cpd": 1.0 if fr=="FG" else 2.0, "cpu": 5.0 if fr=="FG" else 10.0}
 
     tpl_fg_dc = _tpl_row("FG","DC")
     tpl_dc_ct = _tpl_row("DC","City")
 
-    # Build nodes: combine FG, DC, and customers (only those with coordinates)
+    # Build nodes
     nodes = []
-    # DC list: from groups and/or Warehouse sheet
     warehouses = set(wh_df.get("Location", pd.Series(dtype=str)).dropna().astype(str)) | DC
-    # Suppliers = FG
     for s in FG:
-        if s in coord:
-            nodes.append({"id": s, "lat": coord[s]["lat"], "lon": coord[s]["lon"], "kind": "supplier"})
+        coords = coord.get(s)
+        nodes.append({"id": s, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "supplier"})
     for d in warehouses:
-        if d in coord:
-            nodes.append({"id": d, "lat": coord[d]["lat"], "lon": coord[d]["lon"], "kind": "dc"})
+        coords = coord.get(d)
+        nodes.append({"id": d, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "dc"})
     for c in customers:
-        if c in coord:
-            nodes.append({"id": c, "lat": coord[c]["lat"], "lon": coord[c]["lon"], "kind": "customer"})
-        else:
-            # still include as node without coords (will be hidden on map)
-            nodes.append({"id": c, "lat": None, "lon": None, "kind": "customer"})
+        coords = coord.get(c)
+        nodes.append({"id": c, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "customer"})
     nodes_df = pd.DataFrame(nodes).drop_duplicates(subset=["id"])
 
-    # Build lanes programmatically:
-    #  - For each FG -> DC (all pairs), add per-product lane
-    #    capacity limited by supply at FG/product (shared across outgoing lanes via capacity = supply;
-    #    feasibility ensured by DC->City "fat" caps)
-    #  - For each DC -> City (all pairs), add per-product lane with big capacity (demand-driven)
+    # Build lanes programmatically
     lanes = []
+    # FG -> DC
     for s in FG:
         if s not in coord: continue
         for d in warehouses:
@@ -216,6 +242,7 @@ def read_case() -> dict:
                 cost = tpl_fg_dc["cpu"] + tpl_fg_dc["cpd"] * dist
                 lanes.append({"src": s, "dst": d, "product": p, "capacity": cap, "cost_per_unit": cost})
 
+    # DC -> City
     for d in warehouses:
         if d not in coord: continue
         for c in customers:
@@ -223,16 +250,15 @@ def read_case() -> dict:
             dist = haversine_km(coord[d]["lat"], coord[d]["lon"], coord[c]["lat"], coord[c]["lon"])
             for p in products:
                 dem_p = float(demand[(demand["customer"]==c) & (demand["product"]==p)]["demand"].sum())
-                cap = (dem_p * 2.0) + 1e6  # generous per-lane cap to avoid binding here
+                cap = (dem_p * 2.0) + 1e6  # generous cap
                 cost = tpl_dc_ct["cpu"] + tpl_dc_ct["cpd"] * dist
                 lanes.append({"src": d, "dst": c, "product": p, "capacity": cap, "cost_per_unit": cost})
 
-    # Final case dict
     return {
         "nodes": nodes_df,
-        "demand": demand,             # columns: customer, product, demand
-        "supply": supply,             # columns: supplier, product, supply
-        "lanes": pd.DataFrame(lanes), # columns: src, dst, product, capacity, cost_per_unit
+        "demand": demand,             # customer, product, demand
+        "supply": supply,             # supplier, product, supply
+        "lanes": pd.DataFrame(lanes), # src, dst, product, capacity, cost_per_unit
         "products": products
     }
 
@@ -269,7 +295,7 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     vidx = {k:i for i,k in enumerate(var_keys)}
     n_x = len(var_keys)
 
-    # Slack vars: disposal per supplier/product, shortage per customer/product
+    # Slack vars
     cust_prod = sorted({(r["customer"], r["product"]) for _, r in demand_df.iterrows()})
     supp_prod = sorted({(r["supplier"], r["product"]) for _, r in supply_df.iterrows()})
     sp_index = {k: n_x + i for i, k in enumerate(supp_prod)}                 # disposal
@@ -360,13 +386,13 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
 
     return {
         "ok": bool(res.success),
-        "objective_cost": objective,
+        "objective_cost": objective if res.success else None,
         "used_slacks": (total_disposal > 1e-6) or (total_shortage > 1e-6),
-        "total_shortage": total_shortage,
-        "total_disposal": total_disposal,
+        "total_shortage": total_shortage if res.success else None,
+        "total_disposal": total_disposal if res.success else None,
         "nodes": nrecs,
         "products": products_list,
-        "flows": flows,
+        "flows": flows if res.success else [],
         "currency": "EUR",
         "flow_unit": "units"
     }
@@ -381,66 +407,68 @@ def build_baseline() -> tuple[dict, dict]:
     return base, case
 
 def incident_1(case: dict, prev: dict) -> dict:
-    if not prev.get("flows"):
-        return {"title":"Incident 1","objective_before":prev.get("objective_cost"),"objective_after":prev.get("objective_cost"),"flows_after":prev.get("flows",[])}
-    biggest = sorted(prev["flows"], key=lambda x: x["flow"], reverse=True)[0]
+    flows_prev = prev.get("flows_after") or prev.get("flows") or []
+    if not flows_prev:
+        return {"title":"Incident 1","objective_before":prev.get("objective_after"),"objective_after":prev.get("objective_after"),"flows_after":flows_prev}
+    biggest = sorted(flows_prev, key=lambda x: x["flow"], reverse=True)[0]
     shock = {"type": "lane_cap", "src": biggest["src"], "dst": biggest["dst"], "product": biggest["product"], "new_capacity": max(0.5*biggest["flow"], 1.0)}
-    before = prev["objective_cost"]
+    before = prev.get("objective_after")
     aft = solve_min_cost_flow(case, shock)
     return {
         "title": "Incident 1 — Corridor capacity restriction",
         "lane": {"src": shock["src"], "dst": shock["dst"], "product": biggest["product"]},
         "objective_before": before,
-        "objective_after": aft["objective_cost"],
-        "used_slacks": aft["used_slacks"],
-        "total_shortage": aft["total_shortage"],
-        "total_disposal": aft["total_disposal"],
-        "flows_after": aft["flows"],
-        "currency": aft["currency"], "flow_unit": aft["flow_unit"]
+        "objective_after": aft.get("objective_cost"),
+        "used_slacks": aft.get("used_slacks"),
+        "total_shortage": aft.get("total_shortage"),
+        "total_disposal": aft.get("total_disposal"),
+        "flows_after": aft.get("flows", []),
+        "currency": aft.get("currency"), "flow_unit": aft.get("flow_unit")
     }
 
 def incident_2(case: dict, prev: dict) -> dict:
-    if not prev.get("flows"):
-        return {"title":"Incident 2","objective_before":prev.get("objective_cost"),"objective_after":prev.get("objective_cost"),"flows_after":prev.get("flows",[])}
-    # choose the customer with largest inbound flow previously
+    flows_prev = prev.get("flows_after") or prev.get("flows") or []
+    if not flows_prev:
+        return {"title":"Incident 2","objective_before":prev.get("objective_after"),"objective_after":prev.get("objective_after"),"flows_after":flows_prev}
     dest_tot = {}
-    for f in prev["flows"]:
+    for f in flows_prev:
         dest_tot[f["dst"]] = dest_tot.get(f["dst"], 0.0) + f["flow"]
     customer = sorted(dest_tot.items(), key=lambda kv: kv[1], reverse=True)[0][0]
     shock = {"type": "demand_spike", "customer": customer, "pct": 0.25}
-    before = prev["objective_cost"]
+    before = prev.get("objective_after")
     aft = solve_min_cost_flow(case, shock)
     return {
         "title": "Incident 2 — Demand surge (+25%)",
         "customer": customer,
         "objective_before": before,
-        "objective_after": aft["objective_cost"],
-        "used_slacks": aft["used_slacks"],
-        "total_shortage": aft["total_shortage"],
-        "total_disposal": aft["total_disposal"],
-        "flows_after": aft["flows"],
-        "currency": aft["currency"], "flow_unit": aft["flow_unit"]
+        "objective_after": aft.get("objective_cost"),
+        "used_slacks": aft.get("used_slacks"),
+        "total_shortage": aft.get("total_shortage"),
+        "total_disposal": aft.get("total_disposal"),
+        "flows_after": aft.get("flows", []),
+        "currency": aft.get("currency"), "flow_unit": aft.get("flow_unit")
     }
 
 def incident_3(case: dict, prev: dict) -> dict:
-    if not prev.get("flows"):
-        return {"title":"Incident 3","objective_before":prev.get("objective_cost"),"objective_after":prev.get("objective_cost"),"flows_after":prev.get("flows",[])}
-    top = sorted(prev["flows"], key=lambda x: x["flow"], reverse=True)[0]
+    flows_prev = prev.get("flows_after") or prev.get("flows") or []
+    if not flows_prev:
+        return {"title":"Incident 3","objective_before":prev.get("objective_after"),"objective_after":prev.get("objective_after"),"flows_after":flows_prev}
+    top = sorted(flows_prev, key=lambda x: x["flow"], reverse=True)[0]
     src, dst, pr = top["src"], top["dst"], top["product"]
     shock = {"type": "express_lane", "src": src, "dst": dst, "product": pr,
              "capacity": max(top["flow"]*0.5, 1.0), "cost_per_unit": 0.5}
-    before = prev["objective_cost"]
+    before = prev.get("objective_after")
     aft = solve_min_cost_flow(case, shock)
     return {
         "title": "Incident 3 — Strategic express lane",
         "lane": {"src": src, "dst": dst, "cost_per_unit": shock["cost_per_unit"], "capacity": shock["capacity"]},
         "objective_before": before,
-        "objective_after": aft["objective_cost"],
-        "used_slacks": aft["used_slacks"],
-        "total_shortage": aft["total_shortage"],
-        "total_disposal": aft["total_disposal"],
-        "flows_after": aft["flows"],
-        "currency": aft["currency"], "flow_unit": aft["flow_unit"]
+        "objective_after": aft.get("objective_cost"),
+        "used_slacks": aft.get("used_slacks"),
+        "total_shortage": aft.get("total_shortage"),
+        "total_disposal": aft.get("total_disposal"),
+        "flows_after": aft.get("flows", []),
+        "currency": aft.get("currency"), "flow_unit": aft.get("flow_unit")
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -541,13 +569,13 @@ def deterministic_explanation(idx: int, payload: dict) -> str:
     after  = payload.get("objective_after")
     bits = [payload.get("title", f"Incident {idx}"), "."]
     if before is not None and after is not None:
-        bits.append(f" Objective moved {before:,.2f} → {after:,.2f} (Δ {after-before:+,.2f}).")
+        bits.append(f" Objective moved {fmt(before)} → {fmt(after)} (Δ {safe_delta(after,before)}).")
     lane = payload.get("lane")
     if lane:
         parts=[]
         if "src" in lane and "dst" in lane: parts.append(f"{lane['src']}→{lane['dst']}")
-        if "cost_per_unit" in lane: parts.append(f"cpu={lane['cost_per_unit']}")
-        if "capacity" in lane: parts.append(f"cap={lane['capacity']}")
+        if "cost_per_unit" in lane: parts.append(f"cpu={fmt(lane['cost_per_unit'])}")
+        if "capacity" in lane: parts.append(f"cap={fmt(lane['capacity'])}")
         if parts: bits.append(" Lane: " + ", ".join(parts) + ".")
     if payload.get("customer"): bits.append(f" Customer: {payload['customer']}.")
     if payload.get("used_slacks"): bits.append(" Feasibility fallback applied.")
@@ -582,7 +610,6 @@ def gemini_explain(idx: int, payload: dict) -> str:
             generation_config={"temperature": temperature, "max_output_tokens": max_tokens}
         )
         text = (resp.text or "").strip()
-        # simple domain guard
         if any(w in text.lower() for w in ["passenger", "ridership", "ticket"]):
             return deterministic_explanation(idx, payload)
         return text if text else deterministic_explanation(idx, payload)
@@ -619,16 +646,21 @@ with c1:
         base, case = build_baseline()
         st.session_state["case"] = case
         st.session_state["base"] = base
+
+        base_obj = base.get("objective_cost")
         st.session_state["payloads"]["0"] = {
             "title": "Baseline",
-            "objective_before": base["objective_cost"],
-            "objective_after": base["objective_cost"],
-            "flows_after": base["flows"],
-            "currency": base["currency"], "flow_unit": base["flow_unit"]
+            "objective_before": base_obj,
+            "objective_after": base_obj,
+            "flows_after": base.get("flows", []),
+            "currency": base.get("currency"), "flow_unit": base.get("flow_unit")
         }
         st.session_state["phase"] = "baseline"
-        st.session_state["maps"]["0"] = build_map(base["nodes"], base["flows"], base["products"])
-        st.success(f"Baseline solved (data source: {st.session_state['case_loaded_from']}).")
+        st.session_state["maps"]["0"] = build_map(base.get("nodes", []), base.get("flows", []), base.get("products", []))
+        if base.get("ok"):
+            st.success(f"Baseline solved (source: {st.session_state['case_loaded_from']}). Objective {fmt(base_obj)}.")
+        else:
+            st.warning("Baseline infeasible. Slacks required or data incomplete. You can still run incidents to test the narrative.")
 
 with c2:
     if st.button("🚨 Run Incident 1 now"):
@@ -636,11 +668,12 @@ with c2:
             st.warning("Run baseline first.")
         else:
             case = st.session_state["case"]
-            prev = st.session_state["payloads"]["0"]
+            prev = st.session_state["payloads"]["0"] or {}
             resp1 = incident_1(case, prev)
             st.session_state["payloads"]["1"] = resp1
             st.session_state["phase"] = "incident1"
-            st.session_state["maps"]["1"] = build_map(st.session_state["base"]["nodes"], resp1.get("flows_after",[]), st.session_state["base"]["products"])
+            flows1 = resp1.get("flows_after", [])
+            st.session_state["maps"]["1"] = build_map(st.session_state["base"]["nodes"], flows1, st.session_state["base"]["products"])
             ensure_explanation(1, resp1)
             st.success("Incident 1 executed.")
 
@@ -652,11 +685,12 @@ with st.sidebar:
             st.warning("Run baseline first.")
         else:
             case = st.session_state["case"]
-            prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+            prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"] or {}
             resp2 = incident_2(case, prev)
             st.session_state["payloads"]["2"] = resp2
             st.session_state["phase"] = "incident2"
-            st.session_state["maps"]["2"] = build_map(st.session_state["base"]["nodes"], resp2.get("flows_after",[]), st.session_state["base"]["products"])
+            flows2 = resp2.get("flows_after", [])
+            st.session_state["maps"]["2"] = build_map(st.session_state["base"]["nodes"], flows2, st.session_state["base"]["products"])
             ensure_explanation(2, resp2)
             st.success("Incident 2 executed.")
     if st.button("▶️ Incident 3 (strategic express lane)"):
@@ -664,32 +698,33 @@ with st.sidebar:
             st.warning("Run baseline first.")
         else:
             case = st.session_state["case"]
-            prev = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+            prev = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"] or {}
             resp3 = incident_3(case, prev)
             st.session_state["payloads"]["3"] = resp3
             st.session_state["phase"] = "incident3"
-            st.session_state["maps"]["3"] = build_map(st.session_state["base"]["nodes"], resp3.get("flows_after",[]), st.session_state["base"]["products"])
+            flows3 = resp3.get("flows_after", [])
+            st.session_state["maps"]["3"] = build_map(st.session_state["base"]["nodes"], flows3, st.session_state["base"]["products"])
             ensure_explanation(3, resp3)
             st.success("Incident 3 executed.")
 
-# Agent narrative
+# Agent narrative (safe formatting everywhere)
 with agent:
     ph = st.session_state["phase"]
     if ph == "baseline" and st.session_state["payloads"]["0"]:
         p = st.session_state["payloads"]["0"]
-        st.write(f"**Agent**: Baseline active. Objective **{p['objective_after']:,.2f}**. Monitoring lanes & capacity headroom.")
+        st.write(f"**Agent**: Baseline active. Objective **{fmt(p.get('objective_after'))}**. Monitoring lanes & capacity headroom.")
     elif ph == "incident1" and st.session_state["payloads"]["1"]:
         p = st.session_state["payloads"]["1"]
-        st.write(f"**Agent**: {p['title']} | Objective delta **{p['objective_after']-p['objective_before']:+,.2f}**.")
-        st.markdown(st.session_state["explanations"]["1"] or "")
+        st.write(f"**Agent**: {p.get('title','Incident 1')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
+        st.markdown(st.session_state["explanations"].get("1") or "")
     elif ph == "incident2" and st.session_state["payloads"]["2"]:
         p = st.session_state["payloads"]["2"]
-        st.write(f"**Agent**: {p['title']} | Objective delta **{p['objective_after']-p['objective_before']:+,.2f}**.")
-        st.markdown(st.session_state["explanations"]["2"] or "")
+        st.write(f"**Agent**: {p.get('title','Incident 2')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
+        st.markdown(st.session_state["explanations"].get("2") or "")
     elif ph == "incident3" and st.session_state["payloads"]["3"]:
         p = st.session_state["payloads"]["3"]
-        st.write(f"**Agent**: {p['title']} | Objective delta **{p['objective_after']-p['objective_before']:+,.2f}**.")
-        st.markdown(st.session_state["explanations"]["3"] or "")
+        st.write(f"**Agent**: {p.get('title','Incident 3')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
+        st.markdown(st.session_state["explanations"].get("3") or "")
     else:
         st.caption("Ready. Solve baseline, then run incidents.")
 
@@ -708,11 +743,11 @@ if st.session_state["payloads"]["1"]:
     p1 = st.session_state["payloads"]["1"]
     st.divider()
     st.subheader("Incident 1 — Corridor capacity restriction")
-    before, after = float(p1.get("objective_before", 0.0)), float(p1.get("objective_after", 0.0))
+    before, after = p1.get("objective_before"), p1.get("objective_after")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Objective (before)", f"{before:,.2f}")
-    c2.metric("Objective (after)", f"{after:,.2f}", delta=f"{after-before:+,.2f}")
-    c3.metric("Δ (after-before)", f"{after-before:+,.2f}")
+    c1.metric("Objective (before)", fmt(before))
+    c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
+    c3.metric("Δ (after-before)", safe_delta(after, before))
     if p1.get("lane"):
         st.caption(f"Lane impacted: {p1['lane']['src']} → {p1['lane']['dst']}")
     with st.container(border=True):
@@ -725,11 +760,11 @@ if st.session_state["payloads"]["2"]:
     p2 = st.session_state["payloads"]["2"]
     st.divider()
     st.subheader("Incident 2 — Demand surge (+25%)")
-    before, after = float(p2.get("objective_before", 0.0)), float(p2.get("objective_after", 0.0))
+    before, after = p2.get("objective_before"), p2.get("objective_after")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Objective (before)", f"{before:,.2f}")
-    c2.metric("Objective (after)", f"{after:,.2f}", delta=f"{after-before:+,.2f}")
-    c3.metric("Δ (after-before)", f"{after-before:+,.2f}")
+    c1.metric("Objective (before)", fmt(before))
+    c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
+    c3.metric("Δ (after-before)", safe_delta(after, before))
     if p2.get("customer"): st.caption(f"Customer impacted: {p2['customer']}")
     with st.container(border=True):
         st.markdown("**Network Map (Incident 2)**")
@@ -741,15 +776,15 @@ if st.session_state["payloads"]["3"]:
     p3 = st.session_state["payloads"]["3"]
     st.divider()
     st.subheader("Incident 3 — Strategic express lane")
-    before, after = float(p3.get("objective_before", 0.0)), float(p3.get("objective_after", 0.0))
+    before, after = p3.get("objective_before"), p3.get("objective_after")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Objective (before)", f"{before:,.2f}")
-    c2.metric("Objective (after)", f"{after:,.2f}", delta=f"{after-before:+,.2f}")
-    c3.metric("Δ (after-before)", f"{after-before:+,.2f}")
+    c1.metric("Objective (before)", fmt(before))
+    c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
+    c3.metric("Δ (after-before)", safe_delta(after, before))
     if p3.get("lane"):
         l = p3["lane"]
         if "cost_per_unit" in l:
-            st.caption(f"Candidate lane: {l['src']} → {l['dst']} @ {l['cost_per_unit']}")
+            st.caption(f"Candidate lane: {l['src']} → {l['dst']} @ {fmt(l['cost_per_unit'])}")
         else:
             st.caption(f"Candidate lane: {l['src']} → {l['dst']}")
     with st.container(border=True):
