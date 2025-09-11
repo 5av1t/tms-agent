@@ -2,7 +2,6 @@ import os
 import io
 import json
 import math
-import time
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -20,7 +19,7 @@ except Exception:
     genai = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MUST be the first Streamlit command on the page
+# MUST be the first Streamlit command
 # ──────────────────────────────────────────────────────────────────────────────
 PAGE_TITLE = "TMS Agent — Control Tower (Gemini)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
@@ -35,7 +34,7 @@ PALETTE = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# State (ensure AFTER set_page_config)
+# State
 # ──────────────────────────────────────────────────────────────────────────────
 def ensure_state():
     ss = st.session_state
@@ -53,21 +52,16 @@ ensure_state()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Excel parsing tailored to YOUR workbook
-# Sheets present in your file include (relevant ones):
-#   - Customers
-#   - Customer Product Data
-#   - Location
-#   - Transport Cost
+# Relevant sheets:
+#   - Customers                (IDs; may or may not have lat/lon)
+#   - Customer Product Data    (demand)
+#   - Location                 (all site coordinates)
+#   - Transport Cost           (lanes)
 # ──────────────────────────────────────────────────────────────────────────────
 def _norm(s): return str(s).strip().lower()
 
 def load_excel_from_repo_or_upload() -> dict:
-    """
-    Try to load data/base_case.xlsx from the repo.
-    If missing, show a file_uploader to let the user upload the same Excel.
-    Returns a dict containing a Pandas ExcelFile.
-    """
-    # Attempt repo file
+    """Load /data/base_case.xlsx or allow user upload."""
     if os.path.exists(DATA_PATH):
         try:
             xls = pd.ExcelFile(DATA_PATH)
@@ -75,22 +69,31 @@ def load_excel_from_repo_or_upload() -> dict:
         except Exception as e:
             st.error(f"Failed to open {DATA_PATH}: {e}")
 
-    # Fallback to uploader
     up = st.file_uploader("Upload your base_case.xlsx", type=["xlsx"])
     if up is not None:
         try:
-            bytes_buf = io.BytesIO(up.read())
-            xls = pd.ExcelFile(bytes_buf)
+            xls = pd.ExcelFile(io.BytesIO(up.read()))
             return {"source": "upload", "xls": xls}
         except Exception as e:
             st.error(f"Failed to read uploaded file: {e}")
 
-    # If neither present, stop with a friendly message
     st.error(
         "Data file missing. Add `data/base_case.xlsx` to the repo "
         "or upload the Excel above."
     )
     st.stop()
+
+def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool=False) -> Optional[str]:
+    cols = list(df.columns)
+    if contains:
+        for c in cols:
+            if any(token in _norm(c) for token in candidates):
+                return c
+    else:
+        for c in cols:
+            if _norm(c) in [_norm(t) for t in candidates]:
+                return c
+    return None
 
 def read_case() -> dict:
     bundle = load_excel_from_repo_or_upload()
@@ -123,51 +126,84 @@ def read_case() -> dict:
         st.error("Could not find required sheets (Customers, Customer Product Data, Location, Transport Cost).")
         st.stop()
 
-    # Normalize likely column variants
-    # Customers: expect columns: Customer (or CustomerID/Name), Latitude, Longitude
-    cust_id_col = next((c for c in customers_df.columns if _norm(c) in ("customer","customerid","id","name")), None)
-    cust_lat_col = next((c for c in customers_df.columns if "lat" in _norm(c)), None)
-    cust_lon_col = next((c for c in customers_df.columns if "lon" in _norm(c)), None)
-    if not all([cust_id_col, cust_lat_col, cust_lon_col]):
-        st.error("Customers sheet must contain columns for ID/Name and Latitude/Longitude.")
+    # --- Identify key columns (robust, with fallbacks)
+    # Customers: ID (required), lat/lon (optional)
+    cust_id_col = _find_col(customers_df, ["customer","customerid","id","name"])
+    # optional reference to Location table
+    cust_loc_ref_col = _find_col(customers_df, ["location","site","node"])
+
+    cust_lat_col = _find_col(customers_df, ["lat"], contains=True)  # accepts 'Latitude', 'lat', etc.
+    cust_lon_col = _find_col(customers_df, ["lon","lng","long"], contains=True)
+
+    if not cust_id_col:
+        st.error("Customers sheet must contain an ID/Name column (e.g., 'Customer', 'CustomerID', 'Name').")
         st.stop()
 
-    # Demand: expect columns: Customer, Product, Demand
-    dem_cust_col = next((c for c in demand_df.columns if _norm(c) in ("customer","customerid","id","name")), None)
-    dem_prod_col = next((c for c in demand_df.columns if _norm(c)=="product"), None)
-    dem_qty_col  = next((c for c in demand_df.columns if _norm(c) in ("demand","qty","quantity","volume")), None)
+    # Demand: Customer, Product, Demand
+    dem_cust_col = _find_col(demand_df, ["customer","customerid","id","name"])
+    dem_prod_col = _find_col(demand_df, ["product"])
+    dem_qty_col  = _find_col(demand_df, ["demand","qty","quantity","volume"])
     if not all([dem_cust_col, dem_prod_col, dem_qty_col]):
         st.error("Customer Product Data sheet must contain Customer, Product, Demand columns.")
         st.stop()
 
-    # Location: for non-customer nodes (suppliers/DCs)
-    loc_id_col = next((c for c in loc_df.columns if _norm(c) in ("location","id","name","site")), None)
-    loc_lat_col = next((c for c in loc_df.columns if "lat" in _norm(c)), None)
-    loc_lon_col = next((c for c in loc_df.columns if "lon" in _norm(c)), None)
+    # Location: Location ID, lat, lon
+    loc_id_col = _find_col(loc_df, ["location","id","name","site"])
+    loc_lat_col = _find_col(loc_df, ["lat"], contains=True)
+    loc_lon_col = _find_col(loc_df, ["lon","lng","long"], contains=True)
     if not all([loc_id_col, loc_lat_col, loc_lon_col]):
         st.error("Location sheet must contain Location ID/Name and Latitude/Longitude.")
         st.stop()
 
-    # Transport Cost: columns: Source, Destination, Product, Capacity, Cost_per_unit
-    lanes_src_col = next((c for c in lanes_df.columns if _norm(c) in ("source","src","from")), None)
-    lanes_dst_col = next((c for c in lanes_df.columns if _norm(c) in ("destination","dest","dst","to")), None)
-    lanes_pr_col  = next((c for c in lanes_df.columns if _norm(c)=="product"), None)
-    lanes_cap_col = next((c for c in lanes_df.columns if _norm(c) in ("capacity","cap")), None)
-    lanes_cost_col= next((c for c in lanes_df.columns if "cost" in _norm(c)), None)
+    # Lanes: Source, Destination, Product, Capacity, Cost
+    lanes_src_col = _find_col(lanes_df, ["source","src","from"])
+    lanes_dst_col = _find_col(lanes_df, ["destination","dest","dst","to"])
+    lanes_pr_col  = _find_col(lanes_df, ["product"])
+    lanes_cap_col = _find_col(lanes_df, ["capacity","cap"])
+    lanes_cost_col= _find_col(lanes_df, ["cost","unit cost","cost_per_unit"], contains=True)
     if not all([lanes_src_col, lanes_dst_col, lanes_pr_col, lanes_cap_col, lanes_cost_col]):
         st.error("Transport Cost sheet must contain Source, Destination, Product, Capacity, and Cost columns.")
         st.stop()
 
-    # Build nodes: combine customers + locations; classify kind
-    customers_df = customers_df.dropna(subset=[cust_id_col])
-    loc_df = loc_df.dropna(subset=[loc_id_col])
+    # --- Build nodes
+    customers_df = customers_df.dropna(subset=[cust_id_col]).copy()
+    loc_df = loc_df.dropna(subset=[loc_id_col]).copy()
 
-    # Customer nodes
-    cust_nodes = customers_df[[cust_id_col, cust_lat_col, cust_lon_col]].copy()
-    cust_nodes.columns = ["id","lat","lon"]
+    # Start with customers minimal frame
+    cust_nodes = customers_df[[cust_id_col]].copy()
+    cust_nodes.columns = ["id"]
     cust_nodes["kind"] = "customer"
 
-    # Non-customer nodes from Location sheet
+    # Merge coordinates into customers:
+    # 1) If Customers already has lat/lon, use them
+    if cust_lat_col and cust_lon_col:
+        cust_nodes = cust_nodes.merge(
+            customers_df[[cust_id_col, cust_lat_col, cust_lon_col]].rename(
+                columns={cust_id_col: "id", cust_lat_col: "lat", cust_lon_col: "lon"}
+            ),
+            on="id", how="left"
+        )
+    else:
+        # 2) Try exact ID match against Location
+        coords_from_loc = loc_df[[loc_id_col, loc_lat_col, loc_lon_col]].rename(
+            columns={loc_id_col:"id", loc_lat_col:"lat", loc_lon_col:"lon"}
+        )
+        cust_nodes = cust_nodes.merge(coords_from_loc, on="id", how="left")
+
+        # 3) If still missing, try Customers' Location/Site reference → Location table
+        if cust_loc_ref_col:
+            ref_map = customers_df[[cust_id_col, cust_loc_ref_col]].rename(
+                columns={cust_id_col:"id", cust_loc_ref_col:"loc_ref"}
+            )
+            ref_coords = coords_from_loc.rename(columns={"id":"loc_ref"})
+            cust_nodes = cust_nodes.merge(ref_map, on="id", how="left")
+            cust_nodes = cust_nodes.merge(ref_coords, on="loc_ref", how="left", suffixes=("","_from_ref"))
+            # fill missing lat/lon from ref
+            cust_nodes["lat"] = cust_nodes["lat"].fillna(cust_nodes.pop("lat_from_ref"))
+            cust_nodes["lon"] = cust_nodes["lon"].fillna(cust_nodes.pop("lon_from_ref"))
+            cust_nodes.drop(columns=["loc_ref"], inplace=True)
+
+    # Non-customer nodes (suppliers/DCs) directly from Location
     loc_nodes = loc_df[[loc_id_col, loc_lat_col, loc_lon_col]].copy()
     loc_nodes.columns = ["id","lat","lon"]
 
@@ -180,43 +216,52 @@ def read_case() -> dict:
         return "dc"  # safe default
     loc_nodes["kind"] = loc_nodes["id"].apply(infer_kind)
 
+    # Combine & dedupe
     nodes_df = pd.concat([cust_nodes, loc_nodes], ignore_index=True).drop_duplicates(subset=["id"])
 
-    # Demand (customer-product)
+    # --- Demand
     demand = demand_df[[dem_cust_col, dem_prod_col, dem_qty_col]].copy()
     demand.columns = ["customer","product","demand"]
     demand["demand"] = pd.to_numeric(demand["demand"], errors="coerce").fillna(0.0)
 
-    # Products list (from demand and lanes)
+    # --- Products
     products = sorted(set(demand["product"].unique()) | set(lanes_df[lanes_pr_col].unique()))
 
-    # Lanes
+    # --- Lanes
     lanes = lanes_df[[lanes_src_col, lanes_dst_col, lanes_pr_col, lanes_cap_col, lanes_cost_col]].copy()
     lanes.columns = ["src","dst","product","capacity","cost_per_unit"]
     lanes["capacity"] = pd.to_numeric(lanes["capacity"], errors="coerce").fillna(0.0)
     lanes["cost_per_unit"] = pd.to_numeric(lanes["cost_per_unit"], errors="coerce").fillna(0.0)
 
-    # Synthetic supply (balanced by total product demand across available sources)
+    # --- Synthetic supply, balanced by total product demand across available sources
     total_demand_per_p = demand.groupby("product")["demand"].sum().to_dict()
+
+    # identify customer ids to avoid treating them as sources
+    customer_ids = set(customers_df[cust_id_col].astype(str))
+
     sources_by_p = {}
     for p in products:
         mask = (lanes["product"] == p)
-        srcs = sorted(set(lanes.loc[mask, "src"]))
-        customer_ids = set(cust_nodes["id"])
+        srcs = sorted(set(lanes.loc[mask, "src"].astype(str)))
         srcs = [s for s in srcs if s not in customer_ids]
-        sources_by_p[p] = srcs if srcs else []
+        if not srcs:
+            # fallback: any non-customer location IDs
+            srcs = list(loc_nodes["id"].astype(str))
+        sources_by_p[p] = srcs
 
     supply_rows = []
     for p in products:
         tot = float(total_demand_per_p.get(p, 0.0))
         srcs = sources_by_p[p]
-        if not srcs:
-            # if no explicit non-customer sources, treat any Location node as a source
-            srcs = list(loc_nodes["id"])
         share = (tot / max(1, len(srcs))) if tot > 0 else 0.0
         for s in srcs:
             supply_rows.append({"supplier": s, "product": p, "supply": share})
     supply = pd.DataFrame(supply_rows)
+
+    # Friendly note if some customers still lack coords (solver ok; map will skip)
+    missing_coords = nodes_df.query("kind=='customer' and (lat.isna() or lon.isna())")["id"].tolist()
+    if missing_coords:
+        st.warning(f"{len(missing_coords)} customer(s) have no coordinates in Customers/Location. They’ll be solved but hidden on the map.")
 
     return {
         "nodes": nodes_df,
@@ -352,9 +397,14 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     # Node list for map
     nrecs = []
     for _, r in case["nodes"].iterrows():
-        try_lat = float(r.get("lat")) if pd.notna(r.get("lat")) else None
-        try_lon = float(r.get("lon")) if pd.notna(r.get("lon")) else None
-        nrecs.append({"id": str(r.get("id")), "kind": str(r.get("kind")), "lat": try_lat, "lon": try_lon})
+        lt = r.get("lat")
+        ln = r.get("lon")
+        nrecs.append({
+            "id": str(r.get("id")),
+            "kind": str(r.get("kind")),
+            "lat": float(lt) if pd.notna(lt) else None,
+            "lon": float(ln) if pd.notna(ln) else None
+        })
 
     products_list = case.get("products", sorted(set([f["product"] for f in flows])))
 
@@ -475,7 +525,8 @@ def build_map(nodes: List[Dict], flows: List[Dict], products: List[str]) -> foli
 
     # nodes
     for n in nodes:
-        if n.get("lat") is None or n.get("lon") is None: continue
+        if n.get("lat") is None or n.get("lon") is None:  # skip nodes without coords
+            continue
         kind = n.get("kind","")
         color = "#198754" if kind not in ("supplier","dc") else ("#6f42c1" if kind=="supplier" else "#0d6efd")
         radius = 6 if kind in ("supplier","dc") else 5
