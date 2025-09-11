@@ -2,6 +2,7 @@ import os
 import io
 import json
 import math
+import time
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -25,9 +26,11 @@ PAGE_TITLE = "TMS Agent — Control Tower (Gemini)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# App constants & small helpers
+# App constants & helpers
 # ──────────────────────────────────────────────────────────────────────────────
 DATA_PATH = os.path.join("data", "base_case.xlsx")
+TICK_INTERVAL = 3.0          # seconds between narration ticks
+THINK_TICKS = 3              # number of narration steps before acting
 PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
@@ -65,24 +68,6 @@ def safe_delta(after, before, none="—", places=2):
     except Exception:
         return none
 
-def ensure_state():
-    ss = st.session_state
-    ss.setdefault("case_loaded_from", None)   # "repo" | "upload"
-    ss.setdefault("case", None)               # parsed inputs
-    ss.setdefault("base", None)               # baseline solve payload
-    ss.setdefault("maps", {})                 # map cache
-    ss.setdefault("payloads", {"0": None, "1": None, "2": None, "3": None})
-    ss.setdefault("explanations", {"0": None, "1": None, "2": None, "3": None})
-    ss.setdefault("phase", "idle")            # idle|baseline|incident1|incident2|incident3
-    ss.setdefault("gem_model", "gemini-1.5-pro")
-    ss.setdefault("gem_temperature", 0.1)
-    ss.setdefault("gem_max_tokens", 300)
-
-ensure_state()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
 def _norm(s): return str(s).strip().lower()
 
 def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool=False) -> Optional[str]:
@@ -101,19 +86,51 @@ def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
     R=6371.0
     dlat=radians(lat2-lat1)
-    dlon=radians(lon2-lon1)
+    dlon=radians(l2:=lon2-lon1)
+    dlon=radians(l2)
     a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     return 2*R*asin(sqrt(a))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Load Excel & parse your schema (AIMMS-like demo workbook)
+# Session state
+# ──────────────────────────────────────────────────────────────────────────────
+def ensure_state():
+    ss = st.session_state
+    # Data & solves
+    ss.setdefault("case_loaded_from", None)
+    ss.setdefault("case", None)                  # parsed inputs
+    ss.setdefault("base", None)                  # baseline solve payload
+    ss.setdefault("maps", {})                    # cached folium maps
+    # Incidents & agent state machine
+    ss.setdefault("phase", "idle")               # idle|baseline_ready|thinking|acting|evaluating|complete
+    ss.setdefault("is_running", False)
+    ss.setdefault("current_incident", None)      # {"id": 1|2|3, "label": "..."}
+    ss.setdefault("incident_queue", [])          # list of incident ids waiting
+    ss.setdefault("tick_count", 0)
+    ss.setdefault("next_tick_at", None)          # epoch seconds
+    ss.setdefault("logs", {"1": [], "2": [], "3": []})
+    # Snapshots for compare
+    ss.setdefault("payloads", {"0": None, "1": None, "2": None, "3": None})
+    # LLM config
+    ss.setdefault("gem_model", "gemini-1.5-pro")
+    ss.setdefault("gem_temperature", 0.1)
+    ss.setdefault("gem_max_tokens", 300)
+    # Explanations cache
+    ss.setdefault("explanations", {"0": None, "1": None, "2": None, "3": None})
+ensure_state()
+
+def log(iid: int, msg: str):
+    st.session_state["logs"].setdefault(str(iid), []).append({"t": time.strftime("%H:%M:%S"), "msg": msg})
+
+def schedule_next_tick():
+    st.session_state["next_tick_at"] = time.time() + TICK_INTERVAL
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Load Excel & parse (AIMMS-like schema)
 # ──────────────────────────────────────────────────────────────────────────────
 def load_excel() -> pd.ExcelFile:
-    # Try repo file first
     if os.path.exists(DATA_PATH):
         return pd.ExcelFile(DATA_PATH)
-
-    # Otherwise allow upload
     up = st.file_uploader("Upload base_case.xlsx", type=["xlsx"])
     if up is None:
         st.error("Data file missing. Add `data/base_case.xlsx` to the repo or upload it here.")
@@ -124,24 +141,21 @@ def read_case() -> dict:
     xls = load_excel()
     st.session_state["case_loaded_from"] = "repo" if os.path.exists(DATA_PATH) else "upload"
 
-    # Load required sheets
     customers_df = pd.read_excel(xls, "Customers")
     demand_df    = pd.read_excel(xls, "Customer Product Data")
     loc_df       = pd.read_excel(xls, "Location")
     lanes_tpl    = pd.read_excel(xls, "Transport Cost")
     groups_df    = pd.read_excel(xls, "Location Groups")
     supp_prod    = pd.read_excel(xls, "Supplier Product")
-    wh_df        = pd.read_excel(xls, "Warehouse")  # optional; used to classify DCs
+    wh_df        = pd.read_excel(xls, "Warehouse")
 
-    # Normalize columns
     for df in (customers_df, demand_df, loc_df, lanes_tpl, groups_df, supp_prod, wh_df):
         df.columns = [str(c).strip() for c in df.columns]
 
     # Customers
     cust_id_col = _find_col(customers_df, ["customer","name","id"])
     if not cust_id_col:
-        st.error("Customers sheet must contain a Customer/Name/ID column.")
-        st.stop()
+        st.error("Customers sheet must contain a Customer/Name/ID column."); st.stop()
     customers = customers_df[cust_id_col].dropna().astype(str).tolist()
 
     # Demand
@@ -149,41 +163,35 @@ def read_case() -> dict:
     dem_prod_col = _find_col(demand_df, ["product"])
     dem_qty_col  = _find_col(demand_df, ["demand","qty","quantity","volume"])
     if not all([dem_cust_col, dem_prod_col, dem_qty_col]):
-        st.error("Customer Product Data must contain Customer, Product, Demand.")
-        st.stop()
+        st.error("Customer Product Data must contain Customer, Product, Demand."); st.stop()
     dem = demand_df[[dem_cust_col, dem_prod_col, dem_qty_col]].copy()
     dem.columns = ["customer","product","demand"]
     dem["demand"] = pd.to_numeric(dem["demand"], errors="coerce").fillna(0.0)
     demand = dem.groupby(["customer","product"])["demand"].sum().reset_index()
 
-    # Locations (lat/lon)
+    # Locations
     loc_id_col = _find_col(loc_df, ["location","name","id"])
     lat_col = _find_col(loc_df, ["lat"], contains=True)
     lon_col = _find_col(loc_df, ["lon","lng","long"], contains=True)
     if not all([loc_id_col, lat_col, lon_col]):
-        st.error("Location sheet must contain Location, Latitude, Longitude.")
-        st.stop()
+        st.error("Location sheet must contain Location, Latitude, Longitude."); st.stop()
     loc = loc_df[[loc_id_col, lat_col, lon_col]].dropna(subset=[loc_id_col]).copy()
     loc.columns = ["id","lat","lon"]
     coord = {r["id"]: {"lat": float(r["lat"]), "lon": float(r["lon"])} for _, r in loc.iterrows()}
 
-    # Location groups (FG/DC)
+    # Location groups
     if "Location" not in groups_df.columns or "SubLocation" not in groups_df.columns:
-        st.error("Location Groups sheet must contain columns Location and SubLocation.")
-        st.stop()
+        st.error("Location Groups sheet must contain columns Location and SubLocation."); st.stop()
     FG = set(groups_df[groups_df["Location"]=="FG"]["SubLocation"].dropna().astype(str))
     DC = set(groups_df[groups_df["Location"]=="DC"]["SubLocation"].dropna().astype(str))
 
-    # Suppliers & supply by product at FG locations
-    sp = supp_prod.copy()
-    sp = sp.rename(columns={"Location":"supplier"})
-    if not {"supplier","Product"}.issubset(set(sp.columns)):
-        st.error("Supplier Product sheet must include Location (or supplier) and Product.")
-        st.stop()
+    # Supply
+    sp = supp_prod.rename(columns={"Location":"supplier"}).copy()
+    if not {"supplier","Product"}.issubset(sp.columns):
+        st.error("Supplier Product must include Location (supplier) and Product."); st.stop()
     cap_col = _find_col(sp, ["Maximum Capacity","Capacity","Cap"])
     if cap_col is None:
-        sp["Maximum Capacity"] = 0.0
-        cap_col = "Maximum Capacity"
+        sp["Maximum Capacity"] = 0.0; cap_col = "Maximum Capacity"
     sp["supply"] = pd.to_numeric(sp[cap_col], errors="coerce").fillna(0.0)
     if "Available" in sp.columns:
         sp["avail"] = pd.to_numeric(sp["Available"], errors="coerce").fillna(1.0)
@@ -193,10 +201,10 @@ def read_case() -> dict:
     sp = sp[sp["supplier"].isin(FG)]
     supply = sp.groupby(["supplier","product"])["supply"].sum().reset_index()
 
-    # Products set
+    # Products
     products = sorted(demand["product"].dropna().astype(str).unique().tolist())
 
-    # Template transport cost: use two rows (FG→DC and DC→City)
+    # Transport cost templates
     def _tpl_row(fr, to):
         if "From Location" in lanes_tpl.columns and "To Location" in lanes_tpl.columns:
             hit = lanes_tpl[(lanes_tpl.get("From Location")==fr) & (lanes_tpl.get("To Location")==to)]
@@ -204,50 +212,49 @@ def read_case() -> dict:
             hit = pd.DataFrame()
         if len(hit) > 0:
             r = hit.iloc[0].to_dict()
-            return {
-                "cpd": float(r.get("Cost per Distance", 1.0) or 1.0),
-                "cpu": float(r.get("Cost Per UOM", 0.0) or 0.0)
-            }
-        # defaults if template not present
+            return {"cpd": float(r.get("Cost per Distance", 1.0) or 1.0),
+                    "cpu": float(r.get("Cost Per UOM", 0.0) or 0.0)}
         return {"cpd": 1.0 if fr=="FG" else 2.0, "cpu": 5.0 if fr=="FG" else 10.0}
 
     tpl_fg_dc = _tpl_row("FG","DC")
     tpl_dc_ct = _tpl_row("DC","City")
 
-    # Build nodes
+    # Nodes
     nodes = []
     warehouses = set(wh_df.get("Location", pd.Series(dtype=str)).dropna().astype(str)) | DC
     for s in FG:
-        coords = coord.get(s)
-        nodes.append({"id": s, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "supplier"})
+        coords = coord.get(s); nodes.append({"id": s, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "supplier"})
     for d in warehouses:
-        coords = coord.get(d)
-        nodes.append({"id": d, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "dc"})
+        coords = coord.get(d); nodes.append({"id": d, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "dc"})
     for c in customers:
-        coords = coord.get(c)
-        nodes.append({"id": c, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "customer"})
+        coords = coord.get(c); nodes.append({"id": c, "lat": coords["lat"] if coords else None, "lon": coords["lon"] if coords else None, "kind": "customer"})
     nodes_df = pd.DataFrame(nodes).drop_duplicates(subset=["id"])
 
-    # Build lanes programmatically
+    # Lanes
+    def d_latlon(a, b):
+        if a not in coord or b not in coord: return None
+        return haversine_km(coord[a]["lat"], coord[a]["lon"], coord[b]["lat"], coord[b]["lon"])
+
     lanes = []
     # FG -> DC
     for s in FG:
         if s not in coord: continue
         for d in warehouses:
             if d not in coord: continue
-            dist = haversine_km(coord[s]["lat"], coord[s]["lon"], coord[d]["lat"], coord[d]["lon"])
+            dist = d_latlon(s, d); 
+            if dist is None: continue
             for p in products:
                 sup_p = float(supply[(supply["supplier"]==s) & (supply["product"]==p)]["supply"].sum())
                 cap = sup_p if sup_p > 0 else 0.0
                 cost = tpl_fg_dc["cpu"] + tpl_fg_dc["cpd"] * dist
                 lanes.append({"src": s, "dst": d, "product": p, "capacity": cap, "cost_per_unit": cost})
-
     # DC -> City
     for d in warehouses:
         if d not in coord: continue
         for c in customers:
             if c not in coord: continue
-            dist = haversine_km(coord[d]["lat"], coord[d]["lon"], coord[c]["lat"], coord[c]["lon"])
+            dist = d_latlon(d, c); 
+            if dist is None: continue
             for p in products:
                 dem_p = float(demand[(demand["customer"]==c) & (demand["product"]==p)]["demand"].sum())
                 cap = (dem_p * 2.0) + 1e6  # generous cap
@@ -256,9 +263,9 @@ def read_case() -> dict:
 
     return {
         "nodes": nodes_df,
-        "demand": demand,             # customer, product, demand
-        "supply": supply,             # supplier, product, supply
-        "lanes": pd.DataFrame(lanes), # src, dst, product, capacity, cost_per_unit
+        "demand": demand,
+        "supply": supply,
+        "lanes": pd.DataFrame(lanes),
         "products": products
     }
 
@@ -320,8 +327,7 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     for s,p in supp_prod:
         row = np.zeros(n_vars)
         for (src,dst,pr), i in vidx.items():
-            if src == s and pr == p:
-                row[i] = 1.0
+            if src == s and pr == p: row[i] = 1.0
         row[sp_index[(s,p)]] = 1.0
         sup_val = float(supply_df[(supply_df["supplier"]==s) & (supply_df["product"]==p)]["supply"].sum())
         A_eq.append(row); b_eq.append(sup_val)
@@ -330,8 +336,7 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     for cst,p in cust_prod:
         row = np.zeros(n_vars)
         for (src,dst,pr), i in vidx.items():
-            if dst == cst and pr == p:
-                row[i] = 1.0
+            if dst == cst and pr == p: row[i] = 1.0
         row[sh_index[(cst,p)]] = 1.0
         dem_val = float(demand_df[(demand_df["customer"]==cst) & (demand_df["product"]==p)]["demand"].sum())
         A_eq.append(row); b_eq.append(dem_val)
@@ -398,78 +403,93 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Incidents
+# Incidents (deterministic action planners)
 # ──────────────────────────────────────────────────────────────────────────────
-def build_baseline() -> tuple[dict, dict]:
-    case = read_case()
-    base = solve_min_cost_flow(case, None)
-    base["title"] = "Baseline"
-    return base, case
+def pick_top_lane(payload: dict) -> Optional[dict]:
+    flows = payload.get("flows_after") or payload.get("flows") or []
+    if not flows: return None
+    return sorted(flows, key=lambda x: x["flow"], reverse=True)[0]
 
-def incident_1(case: dict, prev: dict) -> dict:
-    flows_prev = prev.get("flows_after") or prev.get("flows") or []
-    if not flows_prev:
-        return {"title":"Incident 1","objective_before":prev.get("objective_after"),"objective_after":prev.get("objective_after"),"flows_after":flows_prev}
-    biggest = sorted(flows_prev, key=lambda x: x["flow"], reverse=True)[0]
-    shock = {"type": "lane_cap", "src": biggest["src"], "dst": biggest["dst"], "product": biggest["product"], "new_capacity": max(0.5*biggest["flow"], 1.0)}
-    before = prev.get("objective_after")
-    aft = solve_min_cost_flow(case, shock)
-    return {
-        "title": "Incident 1 — Corridor capacity restriction",
-        "lane": {"src": shock["src"], "dst": shock["dst"], "product": biggest["product"]},
-        "objective_before": before,
-        "objective_after": aft.get("objective_cost"),
-        "used_slacks": aft.get("used_slacks"),
-        "total_shortage": aft.get("total_shortage"),
-        "total_disposal": aft.get("total_disposal"),
-        "flows_after": aft.get("flows", []),
-        "currency": aft.get("currency"), "flow_unit": aft.get("flow_unit")
-    }
-
-def incident_2(case: dict, prev: dict) -> dict:
-    flows_prev = prev.get("flows_after") or prev.get("flows") or []
-    if not flows_prev:
-        return {"title":"Incident 2","objective_before":prev.get("objective_after"),"objective_after":prev.get("objective_after"),"flows_after":flows_prev}
+def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
+    """
+    Returns a dict 'action' to feed into the solver as 'shock', plus a short reasoning string.
+    If GOOGLE_API_KEY is provided, we ask Gemini to pick; else deterministic choice.
+    """
+    # Candidate actions from current context
+    top = pick_top_lane(prev) or {}
+    candidates = []
+    if top:
+        candidates.append({
+            "type": "lane_cap",
+            "label": "Temporarily restrict a congested corridor",
+            "shock": {"type": "lane_cap", "src": top["src"], "dst": top["dst"], "product": top["product"],
+                      "new_capacity": max(0.5 * float(top["flow"]), 1.0)}
+        })
+        candidates.append({
+            "type": "express_lane",
+            "label": "Add a cheaper express lane on the top corridor",
+            "shock": {"type": "express_lane", "src": top["src"], "dst": top["dst"], "product": top["product"],
+                      "capacity": max(0.5 * float(top["flow"]), 1.0), "cost_per_unit": 0.5}
+        })
+    # Demand surge candidate
     dest_tot = {}
-    for f in flows_prev:
+    base_flows = prev.get("flows_after") or prev.get("flows") or []
+    for f in base_flows:
         dest_tot[f["dst"]] = dest_tot.get(f["dst"], 0.0) + f["flow"]
-    customer = sorted(dest_tot.items(), key=lambda kv: kv[1], reverse=True)[0][0]
-    shock = {"type": "demand_spike", "customer": customer, "pct": 0.25}
-    before = prev.get("objective_after")
-    aft = solve_min_cost_flow(case, shock)
-    return {
-        "title": "Incident 2 — Demand surge (+25%)",
-        "customer": customer,
-        "objective_before": before,
-        "objective_after": aft.get("objective_cost"),
-        "used_slacks": aft.get("used_slacks"),
-        "total_shortage": aft.get("total_shortage"),
-        "total_disposal": aft.get("total_disposal"),
-        "flows_after": aft.get("flows", []),
-        "currency": aft.get("currency"), "flow_unit": aft.get("flow_unit")
-    }
+    if dest_tot:
+        hot_cust = sorted(dest_tot.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+        candidates.append({
+            "type": "demand_spike",
+            "label": "Simulate a +25% demand surge at the hottest customer",
+            "shock": {"type": "demand_spike", "customer": hot_cust, "pct": 0.25}
+        })
 
-def incident_3(case: dict, prev: dict) -> dict:
-    flows_prev = prev.get("flows_after") or prev.get("flows") or []
-    if not flows_prev:
-        return {"title":"Incident 3","objective_before":prev.get("objective_after"),"objective_after":prev.get("objective_after"),"flows_after":flows_prev}
-    top = sorted(flows_prev, key=lambda x: x["flow"], reverse=True)[0]
-    src, dst, pr = top["src"], top["dst"], top["product"]
-    shock = {"type": "express_lane", "src": src, "dst": dst, "product": pr,
-             "capacity": max(top["flow"]*0.5, 1.0), "cost_per_unit": 0.5}
-    before = prev.get("objective_after")
-    aft = solve_min_cost_flow(case, shock)
-    return {
-        "title": "Incident 3 — Strategic express lane",
-        "lane": {"src": src, "dst": dst, "cost_per_unit": shock["cost_per_unit"], "capacity": shock["capacity"]},
-        "objective_before": before,
-        "objective_after": aft.get("objective_cost"),
-        "used_slacks": aft.get("used_slacks"),
-        "total_shortage": aft.get("total_shortage"),
-        "total_disposal": aft.get("total_disposal"),
-        "flows_after": aft.get("flows", []),
-        "currency": aft.get("currency"), "flow_unit": aft.get("flow_unit")
-    }
+    # LLM pick (optional)
+    api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if api_key and genai is not None:
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(
+                st.session_state.get("gem_model","gemini-1.5-pro"),
+                system_instruction=(
+                    "Choose ONE action from the list based on the incident id.\n"
+                    "Incident 1 prefers 'lane_cap'; Incident 2 prefers 'demand_spike'; Incident 3 prefers 'express_lane'.\n"
+                    "Output JSON with keys: type, index (0-based in the candidate list).\n"
+                )
+            )
+            pref = {1:"lane_cap", 2:"demand_spike", 3:"express_lane"}.get(iid, "lane_cap")
+            prompt = {"incident_id": iid, "preferred": pref, "candidates": candidates}
+            resp = model.generate_content(json.dumps(prompt), generation_config={"temperature": float(st.session_state.get("gem_temperature",0.1)), "max_output_tokens": 128})
+            txt = (resp.text or "").strip()
+            j = None
+            try:
+                j = json.loads(txt)
+            except Exception:
+                j = None
+            if j and isinstance(j.get("index"), int) and 0 <= j["index"] < len(candidates):
+                choice = candidates[j["index"]]
+            else:
+                # If LLM output is odd, fall back to preference
+                order = {"lane_cap":0, "demand_spike":1, "express_lane":2}
+                # sort candidates by closeness to preferred type
+                ranked = sorted(candidates, key=lambda c: abs(order.get(c["type"], 10) - order.get(pref,0)))
+                choice = ranked[0] if ranked else (candidates[0] if candidates else {})
+            reason = f"Agent selected '{choice.get('label','action')}' for Incident {iid}."
+            return {"action": choice.get("shock", {}), "reason": reason}
+        except Exception:
+            pass
+
+    # Deterministic fallback (keeps demo consistent)
+    if iid == 1 and any(c["type"]=="lane_cap" for c in candidates):
+        choice = next(c for c in candidates if c["type"]=="lane_cap")
+    elif iid == 2 and any(c["type"]=="demand_spike" for c in candidates):
+        choice = next(c for c in candidates if c["type"]=="demand_spike")
+    elif iid == 3 and any(c["type"]=="express_lane" for c in candidates):
+        choice = next(c for c in candidates if c["type"]=="express_lane")
+    else:
+        choice = candidates[0] if candidates else {"shock": {},"label":"No-op"}
+
+    return {"action": choice.get("shock", {}), "reason": f"Selected deterministic: {choice.get('label','action')}"}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Maps & Tables
@@ -486,7 +506,7 @@ def _product_color_map(products: List[str]) -> Dict[str,str]:
 def _node_by_id(nodes: List[Dict]) -> Dict[str,Dict]:
     return {n["id"]: n for n in nodes}
 
-def _flow_weight_scaler(flows: List[Dict], min_w: float = 0.6, max_w: float = 2.2):
+def _flow_weight_scaler(flows: List[Dict], min_w: float = 0.6, max_w: float = 2.0):
     vals = sorted(float(f.get("flow", 0.0)) for f in flows if f.get("flow", 0.0) > 0)
     if not vals: return lambda x: min_w
     p90 = vals[min(int(0.9*(len(vals)-1)), len(vals)-1)]
@@ -497,7 +517,7 @@ def _flow_weight_scaler(flows: List[Dict], min_w: float = 0.6, max_w: float = 2.
         return max(min_w, min(max_w, w))
     return to_w
 
-def build_map(nodes: List[Dict], flows: List[Dict], products: List[str]) -> folium.Map:
+def build_map(nodes: List[Dict], flows: List[Dict], products: List[str], key_suffix: str) -> folium.Map:
     node_by_id = _node_by_id(nodes)
     lat0, lon0 = _center_latlon(nodes)
     m = folium.Map(location=[lat0,lon0], zoom_start=5, tiles="cartodbpositron")
@@ -541,7 +561,7 @@ def show_flows_table(flows: list[dict], caption="Solved flows"):
     st.caption(caption)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LLM Narrative (Gemini) with deterministic fallback & light guardrails
+# LLM Narratives (Gemini) & deterministic fallback
 # ──────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a supply-chain control-tower analyst. Domain: freight TMS (not passengers).\n"
@@ -623,10 +643,137 @@ def ensure_explanation(idx: int, payload: dict):
     st.session_state["explanations"][key] = gemini_explain(idx, payload)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Baseline & incident solvers that attach UI-ready payloads
+# ──────────────────────────────────────────────────────────────────────────────
+def build_baseline() -> tuple[dict, dict]:
+    case = read_case()
+    base = solve_min_cost_flow(case, None)
+    base["title"] = "Baseline"
+    return base, case
+
+def wrap_payload_as_snapshot(payload_after: dict, title: str, before_cost: Optional[float]) -> dict:
+    return {
+        "title": title,
+        "objective_before": before_cost,
+        "objective_after": payload_after.get("objective_cost"),
+        "used_slacks": payload_after.get("used_slacks"),
+        "total_shortage": payload_after.get("total_shortage"),
+        "total_disposal": payload_after.get("total_disposal"),
+        "flows_after": payload_after.get("flows", []),
+        "currency": payload_after.get("currency"),
+        "flow_unit": payload_after.get("flow_unit"),
+        "lane": None,
+        "customer": None
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AGENT STATE MACHINE
+# ──────────────────────────────────────────────────────────────────────────────
+def start_incident(iid: int):
+    if st.session_state["is_running"]:
+        st.warning("Another incident is already running. Please wait for it to complete.")
+        return
+    if not st.session_state.get("base"):
+        st.warning("Run baseline first."); return
+
+    labels = {1: "Incident 1 — Corridor capacity restriction",
+              2: "Incident 2 — Demand surge (+25%)",
+              3: "Incident 3 — Strategic express lane"}
+    st.session_state["current_incident"] = {"id": iid, "label": labels.get(iid, f"Incident {iid}")}
+    st.session_state["is_running"] = True
+    st.session_state["phase"] = "thinking"
+    st.session_state["tick_count"] = 0
+    schedule_next_tick()
+    log(iid, "Started. Agent is analyzing network KPIs and bottlenecks.")
+
+def advance_agent():
+    """Advance the agent by one tick or phase."""
+    if not st.session_state["is_running"]:
+        return
+    now = time.time()
+    if st.session_state["next_tick_at"] is None or now < st.session_state["next_tick_at"]:
+        return  # not yet time
+
+    iid = st.session_state["current_incident"]["id"]
+    phase = st.session_state["phase"]
+
+    # THINKING ticks
+    if phase == "thinking":
+        st.session_state["tick_count"] += 1
+        tick = st.session_state["tick_count"]
+        msg = {
+            1: "Scanning top corridors and DC headroom…",
+            2: "Estimating re-route costs and shortage risk…",
+            3: "Evaluating candidate actions for this incident…",
+        }.get(tick, "Analyzing…")
+        log(iid, msg)
+        if tick >= THINK_TICKS:
+            st.session_state["phase"] = "acting"
+            log(iid, "Decision taken. Executing intervention…")
+        schedule_next_tick()
+        return
+
+    # ACTING → run solver with chosen action
+    if phase == "acting":
+        case = st.session_state["case"]
+        prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+        if iid == 2:
+            prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+        if iid == 3:
+            prev = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+
+        if not prev:
+            prev = wrap_payload_as_snapshot(st.session_state["base"], "Baseline", st.session_state["base"].get("objective_cost"))
+
+        plan = plan_incident_action(iid, case, prev)
+        shock = plan.get("action", {})
+        reason = plan.get("reason", "Selected action.")
+        log(iid, reason)
+
+        after = solve_min_cost_flow(case, shock)
+
+        # Build incident payload
+        payload = {
+            "title": st.session_state["current_incident"]["label"],
+            "objective_before": prev.get("objective_after"),
+            "objective_after": after.get("objective_cost"),
+            "used_slacks": after.get("used_slacks"),
+            "total_shortage": after.get("total_shortage"),
+            "total_disposal": after.get("total_disposal"),
+            "flows_after": after.get("flows", []),
+            "currency": after.get("currency"),
+            "flow_unit": after.get("flow_unit"),
+            "lane": {k: shock[k] for k in ("src","dst","cost_per_unit","capacity") if k in shock} if shock.get("type")!="demand_spike" else None,
+            "customer": shock.get("customer") if shock.get("type")=="demand_spike" else None
+        }
+
+        # Store snapshot & map
+        st.session_state["payloads"][str(iid)] = payload
+        base_nodes = st.session_state["base"]["nodes"]
+        base_products = st.session_state["base"]["products"]
+        st.session_state["maps"][str(iid)] = build_map(base_nodes, payload.get("flows_after", []), base_products, key_suffix=f"i{iid}")
+
+        # Prep explanation
+        ensure_explanation(iid, payload)
+        st.session_state["phase"] = "evaluating"
+        log(iid, "Intervention executed. Summarizing results…")
+        schedule_next_tick()
+        return
+
+    # EVALUATING → finalize and stop
+    if phase == "evaluating":
+        iid = st.session_state["current_incident"]["id"]
+        st.session_state["is_running"] = False
+        st.session_state["phase"] = "complete"
+        log(iid, "Done. KPIs updated. You can now start the next incident.")
+        # no next tick scheduled
+
+# ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.title(PAGE_TITLE)
 
+# Sidebar — Gemini settings and logs
 with st.sidebar:
     st.subheader("Gemini (for explanations)")
     st.caption("Add GOOGLE_API_KEY in Streamlit Secrets. If absent, deterministic narrative is used.")
@@ -634,19 +781,34 @@ with st.sidebar:
     st.session_state["gem_temperature"] = st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("gem_temperature",0.1)), 0.05)
     st.session_state["gem_max_tokens"] = st.number_input("Max tokens", 64, 2048, int(st.session_state.get("gem_max_tokens",300)), 32)
 
+    st.divider()
+    st.subheader("Agent Logs")
+    if st.session_state["current_incident"]:
+        cur = st.session_state["current_incident"]["id"]
+        st.caption(f"Current: Incident {cur}")
+    tabs = st.tabs(["Incident 1", "Incident 2", "Incident 3"])
+    for idx, tab in enumerate(tabs, start=1):
+        with tab:
+            logs = st.session_state["logs"].get(str(idx), [])
+            if not logs:
+                st.caption("No logs yet.")
+            else:
+                for entry in logs[-50:]:
+                    st.write(f"**{entry['t']}** — {entry['msg']}")
+
 st.divider()
 agent = st.container()
 with agent:
     st.subheader("Agent Narrative")
 
+# Bootstrap / Incident controls
 st.divider()
-c1, c2 = st.columns([1,1])
+c1, c2, c3, c4 = st.columns([1,1,1,1])
 with c1:
-    if st.button("🚀 Bootstrap baseline (solve from Excel)"):
+    if st.button("🚀 Bootstrap baseline (solve from Excel)", disabled=st.session_state["is_running"]):
         base, case = build_baseline()
         st.session_state["case"] = case
         st.session_state["base"] = base
-
         base_obj = base.get("objective_cost")
         st.session_state["payloads"]["0"] = {
             "title": "Baseline",
@@ -655,78 +817,72 @@ with c1:
             "flows_after": base.get("flows", []),
             "currency": base.get("currency"), "flow_unit": base.get("flow_unit")
         }
-        st.session_state["phase"] = "baseline"
-        st.session_state["maps"]["0"] = build_map(base.get("nodes", []), base.get("flows", []), base.get("products", []))
+        st.session_state["phase"] = "baseline_ready"
+        st.session_state["maps"]["0"] = build_map(base.get("nodes", []), base.get("flows", []), base.get("products", []), key_suffix="base")
         if base.get("ok"):
             st.success(f"Baseline solved (source: {st.session_state['case_loaded_from']}). Objective {fmt(base_obj)}.")
         else:
             st.warning("Baseline infeasible. Slacks required or data incomplete. You can still run incidents to test the narrative.")
 
 with c2:
-    if st.button("🚨 Run Incident 1 now"):
-        if not st.session_state.get("base"):
-            st.warning("Run baseline first.")
-        else:
-            case = st.session_state["case"]
-            prev = st.session_state["payloads"]["0"] or {}
-            resp1 = incident_1(case, prev)
-            st.session_state["payloads"]["1"] = resp1
-            st.session_state["phase"] = "incident1"
-            flows1 = resp1.get("flows_after", [])
-            st.session_state["maps"]["1"] = build_map(st.session_state["base"]["nodes"], flows1, st.session_state["base"]["products"])
-            ensure_explanation(1, resp1)
-            st.success("Incident 1 executed.")
+    st.button("▶️ Start Incident 1", key="btn_i1",
+              disabled=st.session_state["is_running"] or (st.session_state.get("base") is None),
+              on_click=lambda: start_incident(1))
 
-with st.sidebar:
-    st.divider()
-    st.caption("Run additional incidents")
-    if st.button("▶️ Incident 2 (demand surge)"):
-        if not st.session_state.get("base"):
-            st.warning("Run baseline first.")
-        else:
-            case = st.session_state["case"]
-            prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"] or {}
-            resp2 = incident_2(case, prev)
-            st.session_state["payloads"]["2"] = resp2
-            st.session_state["phase"] = "incident2"
-            flows2 = resp2.get("flows_after", [])
-            st.session_state["maps"]["2"] = build_map(st.session_state["base"]["nodes"], flows2, st.session_state["base"]["products"])
-            ensure_explanation(2, resp2)
-            st.success("Incident 2 executed.")
-    if st.button("▶️ Incident 3 (strategic express lane)"):
-        if not st.session_state.get("base"):
-            st.warning("Run baseline first.")
-        else:
-            case = st.session_state["case"]
-            prev = st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"] or {}
-            resp3 = incident_3(case, prev)
-            st.session_state["payloads"]["3"] = resp3
-            st.session_state["phase"] = "incident3"
-            flows3 = resp3.get("flows_after", [])
-            st.session_state["maps"]["3"] = build_map(st.session_state["base"]["nodes"], flows3, st.session_state["base"]["products"])
-            ensure_explanation(3, resp3)
-            st.success("Incident 3 executed.")
+with c3:
+    st.button("▶️ Start Incident 2", key="btn_i2",
+              disabled=st.session_state["is_running"] or (st.session_state.get("base") is None),
+              on_click=lambda: start_incident(2))
 
-# Agent narrative (safe formatting everywhere)
+with c4:
+    st.button("▶️ Start Incident 3", key="btn_i3",
+              disabled=st.session_state["is_running"] or (st.session_state.get("base") is None),
+              on_click=lambda: start_incident(3))
+
+# Comparison control
+ref_options = []
+if st.session_state["payloads"]["0"]: ref_options.append("Baseline")
+if st.session_state["payloads"]["1"]: ref_options.append("Incident 1")
+if st.session_state["payloads"]["2"]: ref_options.append("Incident 2")
+if st.session_state["payloads"]["3"]: ref_options.append("Incident 3")
+ref_label = st.selectbox("Compare KPIs against:", options=ref_options or ["Baseline"], index=0, key="compare_ref")
+
+def get_payload_by_label(lbl: str) -> Optional[dict]:
+    return {
+        "Baseline": st.session_state["payloads"].get("0"),
+        "Incident 1": st.session_state["payloads"].get("1"),
+        "Incident 2": st.session_state["payloads"].get("2"),
+        "Incident 3": st.session_state["payloads"].get("3"),
+    }.get(lbl)
+
+# Agent narrative rendering
 with agent:
     ph = st.session_state["phase"]
-    if ph == "baseline" and st.session_state["payloads"]["0"]:
+    if ph == "baseline_ready" and st.session_state["payloads"]["0"]:
         p = st.session_state["payloads"]["0"]
         st.write(f"**Agent**: Baseline active. Objective **{fmt(p.get('objective_after'))}**. Monitoring lanes & capacity headroom.")
-    elif ph == "incident1" and st.session_state["payloads"]["1"]:
-        p = st.session_state["payloads"]["1"]
-        st.write(f"**Agent**: {p.get('title','Incident 1')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
-        st.markdown(st.session_state["explanations"].get("1") or "")
-    elif ph == "incident2" and st.session_state["payloads"]["2"]:
-        p = st.session_state["payloads"]["2"]
-        st.write(f"**Agent**: {p.get('title','Incident 2')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
-        st.markdown(st.session_state["explanations"].get("2") or "")
-    elif ph == "incident3" and st.session_state["payloads"]["3"]:
-        p = st.session_state["payloads"]["3"]
-        st.write(f"**Agent**: {p.get('title','Incident 3')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
-        st.markdown(st.session_state["explanations"].get("3") or "")
+    elif st.session_state["current_incident"] and st.session_state["is_running"]:
+        iid = st.session_state["current_incident"]["id"]
+        label = st.session_state["current_incident"]["label"]
+        tick = st.session_state["tick_count"]
+        steps = {
+            0: f"{label}: Starting analysis…",
+            1: "Analyzing corridor utilization and DC buffers…",
+            2: "Comparing re-route options and cost deltas…",
+            3: "Selecting the best intervention…",
+        }
+        st.write(f"**Agent**: {steps.get(tick, 'Working…')}")
+        # Show time to next tick (calm, no flashing)
+        if st.session_state["next_tick_at"]:
+            remain = max(0, int(st.session_state["next_tick_at"] - time.time()))
+            st.caption(f"Next update in ~{remain}s")
+    elif ph == "complete" and st.session_state["current_incident"]:
+        iid = st.session_state["current_incident"]["id"]
+        p = st.session_state["payloads"].get(str(iid)) or {}
+        st.write(f"**Agent**: {p.get('title', f'Incident {iid}')} | Objective delta **{safe_delta(p.get('objective_after'), p.get('objective_before'))}**.")
+        st.markdown(st.session_state["explanations"].get(str(iid)) or "")
     else:
-        st.caption("Ready. Solve baseline, then run incidents.")
+        st.caption("Ready. Solve baseline, then start an incident.")
 
 # Baseline section
 if st.session_state.get("base"):
@@ -738,56 +894,43 @@ if st.session_state.get("base"):
         st_folium(st.session_state["maps"]["0"], width=None, height=520, key="map_base")
     show_flows_table(base.get("flows", []), caption="Baseline solved flows")
 
-# Incident 1
-if st.session_state["payloads"]["1"]:
-    p1 = st.session_state["payloads"]["1"]
+# Incident sections (render when available)
+for iid in (1,2,3):
+    payload = st.session_state["payloads"].get(str(iid))
+    if not payload: continue
     st.divider()
-    st.subheader("Incident 1 — Corridor capacity restriction")
-    before, after = p1.get("objective_before"), p1.get("objective_after")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Objective (before)", fmt(before))
-    c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
-    c3.metric("Δ (after-before)", safe_delta(after, before))
-    if p1.get("lane"):
-        st.caption(f"Lane impacted: {p1['lane']['src']} → {p1['lane']['dst']}")
-    with st.container(border=True):
-        st.markdown("**Network Map (Incident 1)**")
-        st_folium(st.session_state["maps"]["1"], width=None, height=520, key="map_i1")
-    show_flows_table(p1.get("flows_after", []), caption="Flows after Incident 1")
+    st.subheader(payload.get("title", f"Incident {iid}"))
+    before, after = payload.get("objective_before"), payload.get("objective_after")
 
-# Incident 2
-if st.session_state["payloads"]["2"]:
-    p2 = st.session_state["payloads"]["2"]
-    st.divider()
-    st.subheader("Incident 2 — Demand surge (+25%)")
-    before, after = p2.get("objective_before"), p2.get("objective_after")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Objective (before)", fmt(before))
-    c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
-    c3.metric("Δ (after-before)", safe_delta(after, before))
-    if p2.get("customer"): st.caption(f"Customer impacted: {p2['customer']}")
-    with st.container(border=True):
-        st.markdown("**Network Map (Incident 2)**")
-        st_folium(st.session_state["maps"]["2"], width=None, height=520, key="map_i2")
-    show_flows_table(p2.get("flows_after", []), caption="Flows after Incident 2")
+    # Comparison
+    ref_payload = get_payload_by_label(ref_label) or st.session_state["payloads"]["0"]
+    ref_cost = ref_payload.get("objective_after") if ref_payload else None
 
-# Incident 3
-if st.session_state["payloads"]["3"]:
-    p3 = st.session_state["payloads"]["3"]
-    st.divider()
-    st.subheader("Incident 3 — Strategic express lane")
-    before, after = p3.get("objective_before"), p3.get("objective_after")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Objective (before)", fmt(before))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Objective (incident ref before)", fmt(before))
     c2.metric("Objective (after)", fmt(after), delta=safe_delta(after, before))
-    c3.metric("Δ (after-before)", safe_delta(after, before))
-    if p3.get("lane"):
-        l = p3["lane"]
-        if "cost_per_unit" in l:
-            st.caption(f"Candidate lane: {l['src']} → {l['dst']} @ {fmt(l['cost_per_unit'])}")
-        else:
-            st.caption(f"Candidate lane: {l['src']} → {l['dst']}")
+    c3.metric(f"Δ vs {ref_label}", safe_delta(after, ref_cost))
+    c4.metric("Used slacks?", "Yes" if payload.get("used_slacks") else "No")
+    if payload.get("lane"):
+        l = payload["lane"]
+        tag = f"{l.get('src','?')} → {l.get('dst','?')}"
+        if "cost_per_unit" in l: tag += f" @ {fmt(l['cost_per_unit'])}"
+        st.caption(f"Lane changed: {tag}")
+    if payload.get("customer"): st.caption(f"Customer impacted: {payload['customer']}")
+
     with st.container(border=True):
-        st.markdown("**Network Map (Incident 3)**")
-        st_folium(st.session_state["maps"]["3"], width=None, height=520, key="map_i3")
-    show_flows_table(p3.get("flows_after", []), caption="Flows after Incident 3")
+        st.markdown(f"**Network Map ({payload.get('title','Incident')})**")
+        st_folium(st.session_state["maps"].get(str(iid)), width=None, height=520, key=f"map_i{iid}")
+    show_flows_table(payload.get("flows_after", []), caption=f"Flows after {payload.get('title', f'Incident {iid}')}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FINAL: tick driver
+# ──────────────────────────────────────────────────────────────────────────────
+# If an incident is running and time has elapsed, progress the agent and rerun.
+if st.session_state["is_running"]:
+    if st.session_state["next_tick_at"] and time.time() >= st.session_state["next_tick_at"]:
+        advance_agent()
+        if st.session_state["is_running"]:
+            # schedule next tick and re-run to render the next narration step
+            schedule_next_tick()
+        st.experimental_rerun()
