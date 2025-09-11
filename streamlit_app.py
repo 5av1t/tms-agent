@@ -59,6 +59,16 @@ def fmt(x, none="—", places=2):
     except Exception:
         return none
 
+def pct(x) -> Optional[float]:
+    """Safely convert a fraction (e.g., 0.975) to percentage (97.5)."""
+    try:
+        if x is None: return None
+        v = float(x)
+        if np.isnan(v): return None
+        return 100.0 * v
+    except Exception:
+        return None
+
 def safe_delta(after, before, none="—", places=2):
     if after is None or before is None: return none
     try:
@@ -202,7 +212,7 @@ def read_case() -> dict:
     supply = sp.groupby(["supplier","product"])["supply"].sum().reset_index()
 
     # Products
-    products = sorted(demand["product"].dropna().astype(str).unique().tolist())
+    products = sorted(demand["product"].dropna().astype(str).unique().tolist()
 
     # Transport cost templates
     def _tpl_row(fr, to):
@@ -440,7 +450,7 @@ def kpi_explanation_md(k: dict, label: str) -> str:
         f"- **Lanes used**: {fmt(k.get('lanes_used'), places=0)} lanes with non-zero flow.",
         f"- **Avg. cost per unit**: {fmt(k.get('avg_cost_per_unit'))} {k.get('currency','')}/{k.get('flow_unit','')}.",
         f"- **Shortage volume**: {fmt(k.get('shortage_units'))} {k.get('flow_unit','')} not fulfilled.",
-        f"- **Service fill rate**: {fmt(100*(k.get('fill_rate') if k.get('fill_rate') is not None else None), places=1)}%.",
+        f"- **Service fill rate**: {fmt(pct(k.get('fill_rate')), places=1)}%.",
         f"- **Disposals (waste)**: {fmt(k.get('disposal_units'))} {k.get('flow_unit','')} scrapped."
     ]
     lines += [
@@ -464,7 +474,7 @@ def headline_one_liner(title: str, k_now: dict, k_prev: Optional[dict]) -> str:
     cost = k_now.get("total_cost")
     fill = k_now.get("fill_rate")
     cost_txt = f"total transport cost **{fmt(cost)}**" if cost is not None else "transport cost (n/a)"
-    fill_txt = f"service fill rate **{fmt(100*(fill if fill is not None else None), places=1)}%**" if fill is not None else "service (n/a)"
+    fill_txt = f"service fill rate **{fmt(pct(fill), places=1)}%**" if fill is not None else "service (n/a)"
 
     delta_cost = None
     delta_fill = None
@@ -476,11 +486,9 @@ def headline_one_liner(title: str, k_now: dict, k_prev: Optional[dict]) -> str:
 
     driver = title.split("—")[-1].strip() if "—" in title else title
     parts = [f"**{title}** complete:"]
-    # cost movement
     if delta_cost is not None:
         parts.append(f"{'↑' if delta_cost>0 else '↓'} cost {fmt(abs(delta_cost))} vs reference;")
     parts.append(cost_txt + ",")
-    # fill movement
     if delta_fill is not None:
         parts.append(f"{'↑' if delta_fill>0 else '↓'} fill {fmt(abs(delta_fill), places=1)} pp;")
     parts.append(fill_txt + ".")
@@ -500,7 +508,6 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
     Returns a dict 'action' to feed into the solver as 'shock', plus a short reasoning string.
     If GOOGLE_API_KEY is provided, we ask Gemini to pick; else deterministic choice.
     """
-    # Candidate actions from current context
     top = pick_top_lane(prev) or {}
     candidates = []
     if top:
@@ -516,7 +523,6 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
             "shock": {"type": "express_lane", "src": top["src"], "dst": top["dst"], "product": top["product"],
                       "capacity": max(0.5 * float(top["flow"]), 1.0), "cost_per_unit": 0.5}
         })
-    # Demand surge candidate
     dest_tot = {}
     base_flows = prev.get("flows_after") or prev.get("flows") or []
     for f in base_flows:
@@ -529,7 +535,6 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
             "shock": {"type": "demand_spike", "customer": hot_cust, "pct": 0.25}
         })
 
-    # LLM pick (optional)
     api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if api_key and genai is not None:
         try:
@@ -554,7 +559,6 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
             if j and isinstance(j.get("index"), int) and 0 <= j["index"] < len(candidates):
                 choice = candidates[j["index"]]
             else:
-                # If LLM output is odd, fall back to preference
                 order = {"lane_cap":0, "demand_spike":1, "express_lane":2}
                 ranked = sorted(candidates, key=lambda c: abs(order.get(c["type"], 10) - order.get(pref,0)))
                 choice = ranked[0] if ranked else (candidates[0] if candidates else {})
@@ -563,7 +567,6 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
         except Exception:
             pass
 
-    # Deterministic fallback (keeps demo consistent)
     if iid == 1 and any(c["type"]=="lane_cap" for c in candidates):
         choice = next(c for c in candidates if c["type"]=="lane_cap")
     elif iid == 2 and any(c["type"]=="demand_spike" for c in candidates):
@@ -581,7 +584,7 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
 def _center_latlon(nodes: List[Dict]) -> Tuple[float,float]:
     lats = [n.get("lat") for n in nodes if n.get("lat") is not None]
     lons = [n.get("lon") for n in nodes if n.get("lon") is not None]
-    if not lats or not lons: return (20.5937, 78.9629)  # India fallback
+    if not lats or not lons: return (20.5937, 78.9629)
     return (sum(lats)/len(lats), sum(lons)/len(lons))
 
 def _product_color_map(products: List[str]) -> Dict[str,str]:
@@ -722,7 +725,7 @@ def gemini_explain(idx: int, payload: dict) -> str:
 
 def ensure_explanation(idx: int, payload: dict):
     key = str(idx)
-    if st.session_state["explanations"].get(key):  # cached
+    if st.session_state["explanations"].get(key):
         return
     st.session_state["explanations"][key] = gemini_explain(idx, payload)
 
@@ -771,17 +774,15 @@ def start_incident(iid: int):
     log(iid, "Started. Agent is analyzing network KPIs and bottlenecks.")
 
 def advance_agent():
-    """Advance the agent by one tick or phase."""
     if not st.session_state["is_running"]:
         return
     now = time.time()
     if st.session_state["next_tick_at"] is None or now < st.session_state["next_tick_at"]:
-        return  # not yet time
+        return
 
     iid = st.session_state["current_incident"]["id"]
     phase = st.session_state["phase"]
 
-    # THINKING ticks
     if phase == "thinking":
         st.session_state["tick_count"] += 1
         tick = st.session_state["tick_count"]
@@ -797,10 +798,8 @@ def advance_agent():
         schedule_next_tick()
         return
 
-    # ACTING → run solver with chosen action
     if phase == "acting":
         case = st.session_state["case"]
-        # choose reference (previous snapshot)
         prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
         if iid == 2:
             prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
@@ -816,7 +815,6 @@ def advance_agent():
 
         after = solve_min_cost_flow(case, shock)
 
-        # Build incident payload
         payload = {
             "title": st.session_state["current_incident"]["label"],
             "objective_before": prev.get("objective_after"),
@@ -831,25 +829,21 @@ def advance_agent():
             "customer": shock.get("customer") if shock.get("type")=="demand_spike" else None
         }
 
-        # Store snapshot & map
         st.session_state["payloads"][str(iid)] = payload
         base_nodes = st.session_state["base"]["nodes"]
         base_products = st.session_state["base"]["products"]
         st.session_state["maps"][str(iid)] = build_map(base_nodes, payload.get("flows_after", []), base_products, key_suffix=f"i{iid}")
 
-        # Prep explanation
         ensure_explanation(iid, payload)
         st.session_state["phase"] = "evaluating"
         log(iid, "Intervention executed. Summarizing results…")
         schedule_next_tick()
         return
 
-    # EVALUATING → finalize and stop
     if phase == "evaluating":
         st.session_state["is_running"] = False
         st.session_state["phase"] = "complete"
         log(iid, "Done. KPIs updated. You can now start the next scenario.")
-        # no next tick scheduled
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
@@ -938,16 +932,17 @@ def get_payload_by_label(lbl: str) -> Optional[dict]:
         "Incident 3": st.session_state["payloads"].get("3"),
     }.get(lbl)
 
-# Agent narrative rendering — now with one-liner for non-experts
+# Agent narrative rendering — now with safe percentage handling
 with agent:
     ph = st.session_state["phase"]
     if ph == "baseline_ready" and st.session_state["payloads"]["0"]:
         p = st.session_state["payloads"]["0"]
         k = compute_kpis(st.session_state["case"], p)
-        # One-liner (no previous reference for baseline)
-        st.write(f"**Agent**: Baseline ready: total transport cost **{fmt(k['total_cost'])}**, "
-                 f"service fill rate **{fmt(100*(k.get('fill_rate') if k.get('fill_rate') is not None else None), places=1)}%**. "
-                 "This is our starting point to monitor cost and service.")
+        st.write(
+            f"**Agent**: Baseline ready: total transport cost **{fmt(k['total_cost'])}**, "
+            f"service fill rate **{fmt(pct(k.get('fill_rate')), places=1)}%**. "
+            "This is our starting point to monitor cost and service."
+        )
         st.markdown(kpi_explanation_md(k, "Baseline"))
     elif st.session_state["current_incident"] and st.session_state["is_running"]:
         iid = st.session_state["current_incident"]["id"]
@@ -966,14 +961,11 @@ with agent:
     elif ph == "complete" and st.session_state["current_incident"]:
         iid = st.session_state["current_incident"]["id"]
         p = st.session_state["payloads"].get(str(iid)) or {}
-        # Business KPIs & one-liner
         k_now = compute_kpis(st.session_state["case"], p)
-        # choose reference for one-liner = selected compare snapshot
         ref_payload = get_payload_by_label(ref_label) or st.session_state["payloads"]["0"]
         k_prev = compute_kpis(st.session_state["case"], ref_payload) if ref_payload else None
         st.write("**Agent**: " + headline_one_liner(p.get("title", f"Incident {iid}"), k_now, k_prev))
         st.markdown(kpi_explanation_md(k_now, p.get("title", f"Incident {iid}")))
-        # Keep concise technical explanation too
         st.markdown("> " + (st.session_state["explanations"].get(str(iid)) or ""))
     else:
         st.caption("Ready. Initialize baseline, then start a scenario.")
@@ -996,7 +988,6 @@ for iid in (1,2,3):
     st.subheader(payload.get("title", f"Incident {iid}"))
     before, after = payload.get("objective_before"), payload.get("objective_after")
 
-    # Comparison
     ref_payload = get_payload_by_label(ref_label) or st.session_state["payloads"]["0"]
     ref_cost = ref_payload.get("objective_after") if ref_payload else None
 
