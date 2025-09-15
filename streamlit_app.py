@@ -80,9 +80,8 @@ class EventSimulator:
 
     def generate_event(self) -> Optional[Dict]:
         """Returns a randomly generated event dictionary."""
-        event_type = random.choice(["demand_spike", "lane_disruption", "none", "none"]) # 'none' makes events less frequent
-        if event_type == "none":
-            return None
+        # Removed "none" options to ensure an event is always generated for the demo.
+        event_type = random.choice(["demand_spike", "lane_disruption"])
         
         if event_type == "demand_spike" and self.customers:
             customer = random.choice(self.customers)
@@ -349,6 +348,7 @@ def main():
                 st.session_state.current_state = new_state
                 st.session_state.current_kpis = new_kpis
             else:
+                # This case will no longer be reached with the updated code, but is safe to keep.
                 st.toast("Network stable, no new events generated this tick.")
 
 
@@ -388,5 +388,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
