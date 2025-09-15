@@ -1,9 +1,7 @@
-streamlit==1.36.0
-pandas>=2.2.2
-numpy>=1.26.0
-scipy>=1.11.4
-folium>=0.17.0
-streamlit-folium>=0.21.0
-openpyxl>=3.1.2
-google-generativeai>=0.7.2
-pulp>=3
+streamlit
+pandas
+pulp
+folium
+streamlit-folium
+google-generativeai
+openpyxl
