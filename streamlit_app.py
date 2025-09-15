@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.optimize import linprog
+import pulp
 import folium
 from streamlit_folium import st_folium
 
@@ -17,12 +17,12 @@ except Exception:
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
-PAGE_TITLE = "TMS Agent — Control Tower (Gemini)"
+PAGE_TITLE = "TMS Agent — Control Tower (PuLP)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
 DATA_PATH = os.path.join("data", "base_case.xlsx")
-TICK_INTERVAL = 3.0           # seconds between beats
-THINK_TICKS = 3               # analyze beats before act
+TICK_INTERVAL = 3.0        # seconds between beats
+THINK_TICKS = 3            # analyze beats before act
 PALETTE = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
            "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
 
@@ -91,7 +91,7 @@ def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool=False) -> 
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
     R=6371.0
-    dlat=radians(lat2-lat1); dlon=radians(lat2-lon1)
+    dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
     a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     return 2*R*asin(sqrt(a))
 
@@ -105,7 +105,7 @@ def ensure_state():
     ss.setdefault("maps", {})
     ss.setdefault("total_demand", None)
 
-    ss.setdefault("phase", "idle")         # idle|baseline_ready|thinking|acting|evaluating|complete
+    ss.setdefault("phase", "idle")      # idle|baseline_ready|thinking|acting|evaluating|complete
     ss.setdefault("is_running", False)
     ss.setdefault("current_incident", None)
     ss.setdefault("tick_count", 0)
@@ -115,7 +115,7 @@ def ensure_state():
     ss.setdefault("payloads", {"0": None, "1": None, "2": None, "3": None})
     ss.setdefault("progress_total", 0)
     ss.setdefault("progress_done", 0)
-    ss.setdefault("acting_stage", None)    # None|"plan"|"apply"
+    ss.setdefault("acting_stage", None)   # None|"plan"|"apply"
     ss.setdefault("plan_cache", None)
 
     ss.setdefault("gem_model", "gemini-1.5-pro")
@@ -253,7 +253,7 @@ def read_case() -> dict:
                 continue
             for p in products:
                 sup_p=float(supply[(supply["supplier"]==s)&(supply["product"]==p)]["supply"].sum())
-                cap=max(0.0, sup_p)        # cap = available supply for that (s,p)
+                cap=max(0.0, sup_p)         # cap = available supply for that (s,p)
                 cost=tpl_fg_dc["cpu"] + tpl_fg_dc["cpd"]*dist
                 lanes.append({"src":s,"dst":d,"product":p,"capacity":cap,"cost_per_unit":cost})
     # DC->City
@@ -276,7 +276,7 @@ def read_case() -> dict:
             "lanes":pd.DataFrame(lanes),"products":products}
 
 # ─────────────────────────────────────────────────────────────
-# Optimizer (LP with shortage/disposal slacks)
+# Optimizer (REWRITTEN WITH PULP)
 # ─────────────────────────────────────────────────────────────
 def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     nodes = case["nodes"]
@@ -300,76 +300,68 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
                     "capacity":float(shock["capacity"]),"cost_per_unit":float(shock["cost_per_unit"])}
             lanes_df=pd.concat([lanes_df,pd.DataFrame([newrow])],ignore_index=True)
 
-    lanes = lanes_df[["src","dst","product","capacity","cost_per_unit"]].to_dict(orient="records")
-    var_keys=[(l["src"],l["dst"],l["product"]) for l in lanes]
-    vidx={k:i for i,k in enumerate(var_keys)}
-    n_x=len(var_keys)
+    # --- PuLP Model ---
+    prob = pulp.LpProblem("MinCostFlow", pulp.LpMinimize)
 
-    cust_prod=sorted({(r["customer"],r["product"]) for _,r in demand_df.iterrows()})
-    supp_prod=sorted({(r["supplier"],r["product"]) for _,r in supply_df.iterrows()})
-    sp_index={k:n_x+i for i,k in enumerate(supp_prod)}
-    sh_index={k:n_x+len(sp_index)+i for i,k in enumerate(cust_prod)}
-    n_vars=n_x+len(sp_index)+len(sh_index)
+    # Variables
+    lane_keys = [(r['src'], r['dst'], r['product']) for _, r in lanes_df.iterrows()]
+    flow_vars = pulp.LpVariable.dicts("flow", lane_keys, lowBound=0, cat='Continuous')
 
-    BIGM=1e6
-    c=np.zeros(n_vars)
-    for (src,dst,pr),i in vidx.items():
-        row = next(r for r in lanes if r["src"]==src and r["dst"]==dst and r["product"]==pr)
-        c[i]=float(row["cost_per_unit"])
-    for _,i in sp_index.items():
-        c[i]=BIGM
-    for _,i in sh_index.items():
-        c[i]=BIGM
+    supp_prod_keys = [(r['supplier'], r['product']) for _, r in supply_df.iterrows()]
+    disposal_vars = pulp.LpVariable.dicts("disposal", supp_prod_keys, lowBound=0, cat='Continuous')
+    
+    cust_prod_keys = [(r['customer'], r['product']) for _, r in demand_df.iterrows()]
+    shortage_vars = pulp.LpVariable.dicts("shortage", cust_prod_keys, lowBound=0, cat='Continuous')
+    
+    BIGM = 1e6 # Penalty for slacks
 
-    A_eq=[]; b_eq=[]
-    # Supply: sum out + disposal = supply
-    for s,p in supp_prod:
-        row=np.zeros(n_vars)
-        for (src,dst,pr),i in vidx.items():
-            if src==s and pr==p:
-                row[i]=1.0
-        row[sp_index[(s,p)]]=1.0
-        sup_val=float(supply_df[(supply_df["supplier"]==s)&(supply_df["product"]==p)]["supply"].sum())
-        A_eq.append(row); b_eq.append(sup_val)
+    # Objective Function
+    cost_expr = pulp.lpSum(
+        lanes_df.loc[i, 'cost_per_unit'] * flow_vars[(r['src'], r['dst'], r['product'])]
+        for i, r in lanes_df.iterrows()
+    )
+    disposal_penalty = BIGM * pulp.lpSum(disposal_vars)
+    shortage_penalty = BIGM * pulp.lpSum(shortage_vars)
+    prob += cost_expr + disposal_penalty + shortage_penalty, "Total_Cost_with_Penalties"
+    
+    # Constraints
+    # Supply constraints: sum(outflow) + disposal = supply
+    for s, p in supp_prod_keys:
+        outflow = pulp.lpSum(flow_vars.get((s, d, p)) for d in nodes['id'] if (s, d, p) in flow_vars)
+        supply_val = float(supply_df[(supply_df["supplier"]==s)&(supply_df["product"]==p)]["supply"].sum())
+        prob += outflow + disposal_vars[(s, p)] == supply_val, f"supply_{s}_{p}"
 
-    # Demand: sum in + shortage = demand
-    for cst,p in cust_prod:
-        row=np.zeros(n_vars)
-        for (src,dst,pr),i in vidx.items():
-            if dst==cst and pr==p:
-                row[i]=1.0
-        row[sh_index[(cst,p)]]=1.0
-        dem_val=float(demand_df[(demand_df["customer"]==cst)&(demand_df["product"]==p)]["demand"].sum())
-        A_eq.append(row); b_eq.append(dem_val)
+    # Demand constraints: sum(inflow) + shortage = demand
+    for cst, p in cust_prod_keys:
+        inflow = pulp.lpSum(flow_vars.get((s, cst, p)) for s in nodes['id'] if (s, cst, p) in flow_vars)
+        demand_val = float(demand_df[(demand_df["customer"]==cst)&(demand_df["product"]==p)]["demand"].sum())
+        prob += inflow + shortage_vars[(cst, p)] == demand_val, f"demand_{cst}_{p}"
 
-    # Capacity: x <= capacity
-    A_ub=[]; b_ub=[]
-    for (src,dst,pr),i in vidx.items():
-        row=np.zeros(n_vars)
-        row[i]=1.0
-        cap=float(next(r for r in lanes if r["src"]==src and r["dst"]==dst and r["product"]==pr)["capacity"])
-        A_ub.append(row); b_ub.append(cap)
+    # Lane capacity constraints: flow <= capacity
+    for _, r in lanes_df.iterrows():
+        key = (r['src'], r['dst'], r['product'])
+        prob += flow_vars[key] <= r['capacity'], f"cap_{r['src']}_{r['dst']}_{r['product']}"
+        
+    # Solve
+    prob.solve()
+    
+    # --- Extract Results ---
+    is_optimal = pulp.LpStatus[prob.status] == 'Optimal'
+    
+    total_shortage = 0.0
+    total_disposal = 0.0
+    flows = []
+    objective = None
 
-    bounds=[(0,None)]*n_vars
-    res=linprog(c, A_ub=np.array(A_ub) if A_ub else None, b_ub=np.array(b_ub) if A_ub else None,
-                A_eq=np.array(A_eq), b_eq=np.array(b_eq), bounds=bounds, method="highs")
-
-    total_shortage=0.0
-    total_disposal=0.0
-    flows=[]
-    objective=math.inf
-
-    if res.success:
-        x=res.x
-        for (src,dst,pr),i in vidx.items():
-            q = float(x[i])
-            if q > 1e-6:
-                flows.append({"src":src,"dst":dst,"product":pr,"flow":q})
-        for (s,p),i in sp_index.items():
-            total_disposal += float(x[i])
-        for (cst,p),i in sh_index.items():
-            total_shortage += float(x[i])
-        objective=float(res.fun)
+    if is_optimal:
+        objective = pulp.value(prob.objective)
+        for key, var in flow_vars.items():
+            q = var.value()
+            if q is not None and q > 1e-6:
+                flows.append({"src": key[0], "dst": key[1], "product": key[2], "flow": q})
+        
+        total_disposal = sum(var.value() for var in disposal_vars.values() if var.value() is not None)
+        total_shortage = sum(var.value() for var in shortage_vars.values() if var.value() is not None)
 
     # Nodes
     nrecs=[]
@@ -380,14 +372,15 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
 
     products_list = case.get("products", sorted(set([f["product"] for f in flows])))
 
-    return {"ok":bool(res.success),
-            "objective_cost": objective if res.success else None,
-            "used_slacks": (total_disposal>1e-6) or (total_shortage>1e-6),
-            "total_shortage": total_shortage if res.success else None,
-            "total_disposal": total_disposal if res.success else None,
+    return {"ok": is_optimal,
+            "objective_cost": objective,
+            "used_slacks": (total_disposal > 1e-6) or (total_shortage > 1e-6),
+            "total_shortage": total_shortage,
+            "total_disposal": total_disposal,
             "nodes": nrecs, "products":products_list,
-            "flows": flows if res.success else [],
+            "flows": flows,
             "currency":"EUR","flow_unit":"units"}
+
 
 # ─────────────────────────────────────────────────────────────
 # KPIs & narrative
@@ -481,7 +474,7 @@ def gemini_explain(idx: int, payload: dict) -> str:
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(st.session_state.get("gem_model","gemini-1.5-pro"),
-                                      system_instruction=SYSTEM_PROMPT)
+                                        system_instruction=SYSTEM_PROMPT)
         cfg = {"temperature": float(st.session_state.get("gem_temperature",0.1)),
                "max_output_tokens": int(st.session_state.get("gem_max_tokens",300))}
         ctx = {"incident_index": idx, "title": payload.get("title"),
@@ -494,7 +487,7 @@ def gemini_explain(idx: int, payload: dict) -> str:
                "units":{"currency":payload.get("currency","EUR"),"flow_unit":payload.get("flow_unit","units")}}
         resp = model.generate_content("USER JSON:\n"+json.dumps(ctx), generation_config=cfg)
         text = (resp.text or "").strip()
-        if any(w in text.lower() for w in ["passenger","ridership","ticket"]):  # guard
+        if any(w in text.lower() for w in ["passenger","ridership","ticket"]): # guard
             return deterministic_explanation(idx, payload)
         return text if text else deterministic_explanation(idx, payload)
     except Exception:
@@ -609,8 +602,8 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
             genai.configure(api_key=api_key)
             pref={1:"lane_cap",2:"demand_spike",3:"express_lane"}.get(iid,"lane_cap")
             model=genai.GenerativeModel(st.session_state.get("gem_model","gemini-1.5-pro"),
-                        system_instruction=("Pick one candidate for the incident id. Prefer lane_cap for 1, "
-                                            "demand_spike for 2, express_lane for 3. Return JSON {index}."))
+                                system_instruction=("Pick one candidate for the incident id. Prefer lane_cap for 1, "
+                                                    "demand_spike for 2, express_lane for 3. Return JSON {index}."))
             resp=model.generate_content(json.dumps({"incident_id":iid,"preferred":pref,"candidates":candidates}),
                                         generation_config={"temperature":float(st.session_state.get("gem_temperature",0.1)),
                                                            "max_output_tokens":128})
