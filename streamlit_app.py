@@ -3,6 +3,7 @@ import pandas as pd
 import time
 import json
 import random
+import os
 from typing import Dict, List, Optional
 import folium
 from streamlit_folium import st_folium
@@ -14,8 +15,10 @@ from tools import get_available_tools, AVAILABLE_FUNCTIONS
 # Optional Gemini
 try:
     import google.generativeai as genai
+    from google.generativeai.types import Part
 except ImportError:
     genai = None
+    Part = None # Define Part as None if import fails
 
 # --- Page Config ---
 st.set_page_config(
@@ -138,13 +141,13 @@ def draw_map(nodes: List[Dict], flows: List[Dict], products: List[str]) -> foliu
 def display_kpis(kpis: dict, ref_kpis: Optional[dict] = None):
     c1, c2, c3 = st.columns(3)
     
-    cost_delta = (kpis['cost'] - ref_kpis['cost']) if ref_kpis else None
-    c1.metric("Total Transport Cost", f"€{fmt(kpis['cost'], places=0)}", delta=f"€{fmt(cost_delta, places=0)}" if cost_delta is not None else None)
+    cost_delta = (kpis['cost'] - ref_kpis['cost']) if ref_kpis and kpis.get('cost') is not None and ref_kpis.get('cost') is not None else None
+    c1.metric("Total Transport Cost", f"€{fmt(kpis.get('cost'), places=0)}", delta=f"€{fmt(cost_delta, places=0)}" if cost_delta is not None else None)
 
-    fill_delta = (kpis['fill_rate'] - ref_kpis['fill_rate'])*100 if ref_kpis else None
-    c2.metric("Service Fill Rate", f"{kpis['fill_rate']:.2%}", delta=f"{fill_delta:.1f}pp" if fill_delta is not None else None)
+    fill_delta = (kpis['fill_rate'] - ref_kpis['fill_rate'])*100 if ref_kpis and kpis.get('fill_rate') is not None and ref_kpis.get('fill_rate') is not None else None
+    c2.metric("Service Fill Rate", f"{kpis.get('fill_rate', 0):.2%}", delta=f"{fill_delta:.1f}pp" if fill_delta is not None else None)
     
-    c3.metric("Lanes Used", len(kpis['flows']))
+    c3.metric("Lanes Used", len(kpis.get('flows', [])))
 
 # --- Main Agent Class ---
 class TMSAgent:
@@ -166,7 +169,10 @@ class TMSAgent:
                 st.session_state.gemini_model = None
     
     def _calculate_kpis(self, result: dict) -> dict:
+        if not result or not result.get("ok"):
+            return {"cost": None, "fill_rate": 0, "flows": []}
         total_demand = self.model.case['demand']['demand'].sum()
+        if total_demand == 0: total_demand = 1 # Avoid division by zero
         return {
             "cost": result["objective_cost"],
             "fill_rate": 1 - (result["total_shortage"] / total_demand),
@@ -175,60 +181,87 @@ class TMSAgent:
 
     def _get_llm_response(self, prompt: str, use_tools=True) -> Dict:
         """Gets a response from the Gemini model, optionally using tools."""
-        if not st.session_state.gemini_model:
+        if not st.session_state.gemini_model or not Part:
             return {"decision": {"type": "no_op", "reason": "Deterministic fallback: No LLM configured."}}
         
         model = st.session_state.gemini_model
         generation_config = {"response_mime_type": "application/json"}
+        response_text = "" # Initialize for error reporting
         
         try:
-            response = model.generate_content(
+            # First call to the model
+            initial_response = model.generate_content(
                 prompt,
                 tools=self.tools if use_tools else None,
                 generation_config=generation_config
             )
             
-            # --- Tool Calling Logic ---
-            if response.candidates[0].content.parts[0].function_call:
-                fc = response.candidates[0].content.parts[0].function_call
+            # Check for tool call
+            if initial_response.candidates and initial_response.candidates[0].content.parts[0].function_call:
+                fc = initial_response.candidates[0].content.parts[0].function_call
                 tool_name = fc.name
-                tool_args = fc.args
-                st.info(f"🤖 Agent is using tool: `{tool_name}({tool_args})`")
+                tool_args = dict(fc.args) # Convert to a standard dict
+                st.info(f"🤖 Agent is using tool: `{tool_name}({json.dumps(tool_args)})`")
                 
                 # Execute the function
                 function_to_call = self.tool_functions[tool_name]
-                tool_response = function_to_call(**tool_args)
+                tool_response_content = function_to_call(**tool_args)
                 
-                # Send the response back to the model
-                response = model.generate_content(
-                    prompt + f"\nTool output for {tool_name}: {tool_response}",
+                # Send the response back to the model correctly
+                final_response = model.generate_content(
+                    [
+                        initial_response.candidates[0].content, # Include the model's previous turn
+                        Part.from_function_response(           # Add the tool result as a new part
+                            name=tool_name,
+                            response={
+                                "content": tool_response_content,
+                            }
+                        )
+                    ],
                     tools=self.tools,
                     generation_config=generation_config
                 )
+                response_text = final_response.text
+            else:
+                # No tool call, just use the first response
+                response_text = initial_response.text
 
-            return json.loads(response.text)
+            return json.loads(response_text)
 
+        except json.JSONDecodeError as e:
+            st.error(f"LLM Error: Failed to decode JSON response from model.")
+            st.code(response_text, language="text") # Show the raw text for debugging
+            return {"decision": {"type": "no_op", "reason": f"Error parsing LLM JSON response: {e}"}}
         except Exception as e:
-            st.error(f"LLM Error: {e}")
+            st.error(f"LLM Error: An unexpected error occurred: {e}")
             return {"decision": {"type": "no_op", "reason": f"Error during generation: {e}"}}
 
     def plan_and_act(self, event: Dict, current_state: Dict):
         """Main agent loop: Perceive, Plan, Act."""
         # 1. PERCEIVE: Analyze the current situation
         current_kpis = self._calculate_kpis(current_state)
+        
+        if not current_kpis.get("flows"):
+            st.warning("Cannot plan action: current state has no flows to analyze.")
+            return current_state, current_kpis
+
         top_flow = sorted(current_kpis['flows'], key=lambda x: x['flow'], reverse=True)[0]
 
         # 2. PLAN: Formulate candidates and prompt the LLM
+        # Ensure cost_per_unit is a float, not a series/NaN
+        lane_cost_series = self.model.case['lanes'][(self.model.case['lanes']['src']==top_flow['src']) & (self.model.case['lanes']['dst']==top_flow['dst'])]['cost_per_unit']
+        avg_lane_cost = lane_cost_series.mean() if not lane_cost_series.empty else 10.0
+
         candidates = [
             {"type": "no_op", "label": "Take no action and monitor."},
-            {"type": "reroute_ congested", "label": f"Reduce capacity on busiest lane ({top_flow['src']} -> {top_flow['dst']}) to force rerouting.", "shock": {"type": "lane_cap", "src": top_flow['src'], "dst": top_flow['dst'], "new_capacity": top_flow['flow'] * 0.5}},
-            {"type": "add_express_lane", "label": f"Add a temporary express lane from {top_flow['src']} to {top_flow['dst']}.", "shock": {"type": "express_lane", "src": top_flow['src'], "dst": top_flow['dst'], "product": top_flow['product'], "capacity": top_flow['flow'], "cost_per_unit": 0.8 * self.model.case['lanes'][(self.model.case['lanes']['src']==top_flow['src']) & (self.model.case['lanes']['dst']==top_flow['dst'])]['cost_per_unit'].mean()}},
+            {"type": "reroute_congested", "label": f"Reduce capacity on busiest lane ({top_flow['src']} -> {top_flow['dst']}) to force rerouting.", "shock": {"type": "lane_cap", "src": top_flow['src'], "dst": top_flow['dst'], "new_capacity": top_flow['flow'] * 0.5}},
+            {"type": "add_express_lane", "label": f"Add a temporary express lane from {top_flow['src']} to {top_flow['dst']}.", "shock": {"type": "express_lane", "src": top_flow['src'], "dst": top_flow['dst'], "product": top_flow['product'], "capacity": top_flow['flow'], "cost_per_unit": 0.8 * avg_lane_cost}},
         ]
 
         prompt = f"""
         **Situation Analysis**
         An event has occurred: {event['description']}
-        Current KPIs: Total Cost={fmt(current_kpis['cost'])}, Fill Rate={current_kpis['fill_rate']:.2%}
+        Current KPIs: Total Cost={fmt(current_kpis['cost'])}, Fill Rate={current_kpis.get('fill_rate', 0):.2%}
         Busiest Lane: {top_flow['src']} -> {top_flow['dst']} carrying {fmt(top_flow['flow'])} units.
         
         **Memory**
@@ -257,9 +290,14 @@ class TMSAgent:
         new_kpis = self._calculate_kpis(new_state)
 
         # Store memory of the outcome
+        if current_kpis.get("cost") is not None and new_kpis.get("cost") is not None and current_kpis['cost'] > 0:
+             cost_delta_pct = (new_kpis['cost'] - current_kpis['cost']) / current_kpis['cost'] * 100
+        else:
+             cost_delta_pct = 0
+
         outcome = {
-            "cost_delta_pct": (new_kpis['cost'] - current_kpis['cost']) / current_kpis['cost'] * 100,
-            "fill_rate_delta_pp": (new_kpis['fill_rate'] - current_kpis['fill_rate']) * 100,
+            "cost_delta_pct": cost_delta_pct,
+            "fill_rate_delta_pp": (new_kpis.get('fill_rate',0) - current_kpis.get('fill_rate',0)) * 100,
         }
         self.memory.add(event['type'], decision, outcome)
         
@@ -286,10 +324,11 @@ def main():
         st.session_state.agent = TMSAgent(st.session_state.model)
 
     if 'baseline' not in st.session_state:
-        st.session_state.baseline = st.session_state.model.solve()
-        st.session_state.baseline_kpis = st.session_state.agent._calculate_kpis(st.session_state.baseline)
-        st.session_state.current_state = st.session_state.baseline
-        st.session_state.current_kpis = st.session_state.baseline_kpis
+        with st.spinner("Calculating baseline optimization..."):
+            st.session_state.baseline = st.session_state.model.solve()
+            st.session_state.baseline_kpis = st.session_state.agent._calculate_kpis(st.session_state.baseline)
+            st.session_state.current_state = st.session_state.baseline
+            st.session_state.current_kpis = st.session_state.baseline_kpis
 
     model = st.session_state.model
     agent = st.session_state.agent
@@ -302,9 +341,13 @@ def main():
             st.session_state.last_event = event_sim.generate_event()
             # If the event is "none", we just log it and do nothing else.
             if st.session_state.last_event:
-                new_state, new_kpis = agent.plan_and_act(st.session_state.last_event, st.session_state.current_state)
-                st.session_state.current_state = new_state
-                st.session_state.current_kpis = new_kpis
+                with st.spinner("Agent is processing the event..."):
+                    new_state, new_kpis = agent.plan_and_act(st.session_state.last_event, st.session_state.current_state)
+                    st.session_state.current_state = new_state
+                    st.session_state.current_kpis = new_kpis
+            else:
+                st.toast("Network stable, no new events generated this tick.")
+
 
         st.divider()
         st.header("Agent Memory")
@@ -330,11 +373,16 @@ def main():
     # Map and Data Display
     st.header("Network Flow Visualization")
     map_data = st.session_state.current_state
-    folium_map = draw_map(map_data['nodes'], map_data['flows'], map_data['products'])
-    st_folium(folium_map, width=None, height=500)
-    
-    with st.expander("Show Current Flow Data"):
-        st.dataframe(pd.DataFrame(map_data['flows']))
+    if map_data and map_data.get('ok'):
+        folium_map = draw_map(map_data['nodes'], map_data['flows'], map_data['products'])
+        st_folium(folium_map, width=None, height=500)
+        
+        with st.expander("Show Current Flow Data"):
+            st.dataframe(pd.DataFrame(map_data.get('flows', [])))
+    else:
+        st.warning("Current state is not optimal. Cannot display map or flows.")
+
 
 if __name__ == "__main__":
     main()
+
