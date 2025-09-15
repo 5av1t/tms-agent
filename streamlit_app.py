@@ -22,7 +22,7 @@ except ImportError:
 
 # --- Page Config ---
 st.set_page_config(
-    page_title="Level 3 TMS Agent — Control Tower",
+    page_title="TMS Agent — Control Tower",
     layout="wide"
 )
 
@@ -157,8 +157,8 @@ class TMSAgent:
         self.tool_functions = AVAILABLE_FUNCTIONS
 
         if 'gemini_model' not in st.session_state:
-            # Prioritize key from user input in session state, then secrets, then environment
-            api_key = st.session_state.get("google_api_key") or st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            # Prioritize key from Streamlit secrets, then environment variables
+            api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if api_key and genai:
                 try:
                     genai.configure(api_key=api_key)
@@ -189,7 +189,7 @@ class TMSAgent:
     def _get_llm_response(self, prompt: str, use_tools=True) -> Dict:
         """Gets a response from the Gemini model, optionally using tools."""
         if not st.session_state.get("is_llm_configured") or not Part:
-            return {"decision": {"type": "no_op", "label": "No Action (Fallback)", "reason": "Fallback mode: Gemini AI not configured. Provide API key in sidebar."}}
+            return {"decision": {"type": "no_op", "label": "No Action (Fallback)", "reason": "Fallback mode: Gemini AI not configured. Provide API key in Streamlit Secrets."}}
         
         model = st.session_state.gemini_model
         generation_config = {"response_mime_type": "application/json"}
@@ -353,21 +353,6 @@ def main():
 
     # --- Sidebar ---
     with st.sidebar:
-        st.header("Agent Configuration")
-        api_key_input = st.text_input("Enter your Google API Key", type="password", key="api_key_input")
-        if st.button("Configure Agent"):
-            if api_key_input:
-                st.session_state.google_api_key = api_key_input
-                # Force re-initialization of the agent and its model
-                if 'agent' in st.session_state:
-                    del st.session_state['agent']
-                if 'gemini_model' in st.session_state:
-                    del st.session_state['gemini_model']
-                st.success("API Key set! Agent will now use Gemini.")
-                st.rerun()
-            else:
-                st.warning("Please enter a valid API key.")
-
         st.header("Live Simulation Control")
         if st.button("Simulate Next Event", type="primary"):
             st.session_state.last_event = event_sim.generate_event()
@@ -390,7 +375,7 @@ def main():
 
     # Add a persistent warning if the LLM is not configured
     if not st.session_state.get("is_llm_configured"):
-        st.warning("Warning: Gemini AI is not configured. The agent is running in a deterministic fallback mode. Please enter your Google API key in the sidebar to enable intelligent decision-making.", icon="⚠️")
+        st.warning("Warning: Gemini AI is not configured. The agent is running in a deterministic fallback mode. Please add your GOOGLE_API_KEY to your Streamlit Cloud secrets.", icon="⚠️")
 
     if 'last_event' in st.session_state and st.session_state.last_event:
         st.info(st.session_state.last_event['description'])
