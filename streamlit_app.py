@@ -131,7 +131,7 @@ def draw_map(nodes: List[Dict], flows: List[Dict], products: List[str]) -> foliu
         u, v = node_by_id.get(f["src"]), node_by_id.get(f["dst"])
         if u and v and u.get("lat") and v.get("lat"):
             folium.PolyLine(
-                [(u["lat"], u["lon"]), (v["lat"], v["lon"])],
+                [(u["lat"], u["lon"]), (v["lat"], v.get("lon"))],
                 color=color_map.get(f["product"], "#888"),
                 weight=max(1, min(8, f["flow"] / 10000)),
                 opacity=0.7
@@ -238,68 +238,72 @@ class TMSAgent:
 
     def plan_and_act(self, event: Dict, current_state: Dict):
         """Main agent loop: Perceive, Plan, Act."""
-        # 1. PERCEIVE: Analyze the current situation
-        current_kpis = self._calculate_kpis(current_state)
-        
-        if not current_kpis.get("flows"):
-            st.warning("Cannot plan action: current state has no flows to analyze.")
-            return current_state, current_kpis
+        with st.status("🤖 Agent is processing the event...", expanded=True) as status:
+            # 1. PERCEIVE: Analyze the current situation
+            status.write("Step 1: Analyzing the event and current network state.")
+            current_kpis = self._calculate_kpis(current_state)
+            
+            if not current_kpis.get("flows"):
+                st.warning("Cannot plan action: current state has no flows to analyze.")
+                status.update(label="⚠️ Analysis failed: No flows in current state.", state="error")
+                return current_state, current_kpis
 
-        top_flow = sorted(current_kpis['flows'], key=lambda x: x['flow'], reverse=True)[0]
+            top_flow = sorted(current_kpis['flows'], key=lambda x: x['flow'], reverse=True)[0]
 
-        # 2. PLAN: Formulate candidates and prompt the LLM
-        # Ensure cost_per_unit is a float, not a series/NaN
-        lane_cost_series = self.model.case['lanes'][(self.model.case['lanes']['src']==top_flow['src']) & (self.model.case['lanes']['dst']==top_flow['dst'])]['cost_per_unit']
-        avg_lane_cost = lane_cost_series.mean() if not lane_cost_series.empty else 10.0
+            # 2. PLAN: Formulate candidates and prompt the LLM
+            status.write("Step 2: Consulting with Gemini AI for a decision...")
+            lane_cost_series = self.model.case['lanes'][(self.model.case['lanes']['src']==top_flow['src']) & (self.model.case['lanes']['dst']==top_flow['dst'])]['cost_per_unit']
+            avg_lane_cost = lane_cost_series.mean() if not lane_cost_series.empty else 10.0
 
-        candidates = [
-            {"type": "no_op", "label": "Take no action and monitor."},
-            {"type": "reroute_congested", "label": f"Reduce capacity on busiest lane ({top_flow['src']} -> {top_flow['dst']}) to force rerouting.", "shock": {"type": "lane_cap", "src": top_flow['src'], "dst": top_flow['dst'], "new_capacity": top_flow['flow'] * 0.5}},
-            {"type": "add_express_lane", "label": f"Add a temporary express lane from {top_flow['src']} to {top_flow['dst']}.", "shock": {"type": "express_lane", "src": top_flow['src'], "dst": top_flow['dst'], "product": top_flow['product'], "capacity": top_flow['flow'], "cost_per_unit": 0.8 * avg_lane_cost}},
-        ]
+            candidates = [
+                {"type": "no_op", "label": "Take no action and monitor."},
+                {"type": "reroute_congested", "label": f"Reduce capacity on busiest lane ({top_flow['src']} -> {top_flow['dst']}) to force rerouting.", "shock": {"type": "lane_cap", "src": top_flow['src'], "dst": top_flow['dst'], "new_capacity": top_flow['flow'] * 0.5}},
+                {"type": "add_express_lane", "label": f"Add a temporary express lane from {top_flow['src']} to {top_flow['dst']}.", "shock": {"type": "express_lane", "src": top_flow['src'], "dst": top_flow['dst'], "product": top_flow['product'], "capacity": top_flow['flow'], "cost_per_unit": 0.8 * avg_lane_cost}},
+            ]
 
-        prompt = f"""
-        **Situation Analysis**
-        An event has occurred: {event['description']}
-        Current KPIs: Total Cost={fmt(current_kpis['cost'])}, Fill Rate={current_kpis.get('fill_rate', 0):.2%}
-        Busiest Lane: {top_flow['src']} -> {top_flow['dst']} carrying {fmt(top_flow['flow'])} units.
-        
-        **Memory**
-        {self.memory.get_formatted_summary()}
+            prompt = f"""
+            **Situation Analysis**
+            An event has occurred: {event['description']}
+            Current KPIs: Total Cost={fmt(current_kpis['cost'])}, Fill Rate={current_kpis.get('fill_rate', 0):.2%}
+            Busiest Lane: {top_flow['src']} -> {top_flow['dst']} carrying {fmt(top_flow['flow'])} units.
+            
+            **Memory**
+            {self.memory.get_formatted_summary()}
 
-        **Task**
-        Analyze the situation and the event. Use the available tools if you need more context (e.g., check weather for a demand spike location, or traffic on a disrupted lane). Then, decide on the best course of action from the candidates below. Your response must be a JSON object with a single key 'decision', which is one of the candidate objects. Add a 'reason' to your chosen decision.
+            **Task**
+            Analyze the situation and the event. Use the available tools if you need more context (e.g., check weather for a demand spike location, or traffic on a disrupted lane). Then, decide on the best course of action from the candidates below. Your response must be a JSON object with a single key 'decision', which is one of the candidate objects. Add a 'reason' to your chosen decision.
 
-        **Action Candidates:**
-        {json.dumps(candidates, indent=2)}
-        """
-        
-        with st.status("🤖 Agent is thinking...", expanded=True) as status:
-            st.write("Analyzing event and formulating plan...")
+            **Action Candidates:**
+            {json.dumps(candidates, indent=2)}
+            """
             st.code(prompt, language="markdown")
+            
             response_json = self._get_llm_response(prompt)
-            status.update(label="🤖 Agent has made a decision!", state="complete")
-        
-        decision = response_json.get("decision", candidates[0])
-        st.write("##### Agent's Decision")
-        st.json(decision)
+            decision = response_json.get("decision", candidates[0])
+            
+            status.write("Step 3: Gemini AI has made a decision.")
+            st.write("##### Agent's Decision")
+            st.json(decision)
 
-        # 3. ACT: Apply the decision and store memory
-        shock = decision.get("shock")
-        new_state = self.model.solve(shock)
-        new_kpis = self._calculate_kpis(new_state)
+            # 3. ACT: Apply the decision and store memory
+            status.write("Step 4: Applying decision and re-optimizing the network...")
+            shock = decision.get("shock")
+            new_state = self.model.solve(shock)
+            new_kpis = self._calculate_kpis(new_state)
 
-        # Store memory of the outcome
-        if current_kpis.get("cost") is not None and new_kpis.get("cost") is not None and current_kpis['cost'] > 0:
-             cost_delta_pct = (new_kpis['cost'] - current_kpis['cost']) / current_kpis['cost'] * 100
-        else:
-             cost_delta_pct = 0
+            status.write("Step 5: Storing the outcome in memory for future learning.")
+            if current_kpis.get("cost") is not None and new_kpis.get("cost") is not None and current_kpis['cost'] > 0:
+                 cost_delta_pct = (new_kpis['cost'] - current_kpis['cost']) / current_kpis['cost'] * 100
+            else:
+                 cost_delta_pct = 0
 
-        outcome = {
-            "cost_delta_pct": cost_delta_pct,
-            "fill_rate_delta_pp": (new_kpis.get('fill_rate',0) - current_kpis.get('fill_rate',0)) * 100,
-        }
-        self.memory.add(event['type'], decision, outcome)
+            outcome = {
+                "cost_delta_pct": cost_delta_pct,
+                "fill_rate_delta_pp": (new_kpis.get('fill_rate',0) - current_kpis.get('fill_rate',0)) * 100,
+            }
+            self.memory.add(event['type'], decision, outcome)
+            
+            status.update(label="✅ Agent action complete!", state="complete", expanded=False)
         
         return new_state, new_kpis
 
@@ -341,10 +345,9 @@ def main():
             st.session_state.last_event = event_sim.generate_event()
             # If the event is "none", we just log it and do nothing else.
             if st.session_state.last_event:
-                with st.spinner("Agent is processing the event..."):
-                    new_state, new_kpis = agent.plan_and_act(st.session_state.last_event, st.session_state.current_state)
-                    st.session_state.current_state = new_state
-                    st.session_state.current_kpis = new_kpis
+                new_state, new_kpis = agent.plan_and_act(st.session_state.last_event, st.session_state.current_state)
+                st.session_state.current_state = new_state
+                st.session_state.current_kpis = new_kpis
             else:
                 st.toast("Network stable, no new events generated this tick.")
 
@@ -385,4 +388,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
