@@ -22,7 +22,7 @@ except ImportError:
 
 # --- Page Config ---
 st.set_page_config(
-    page_title="TMS Agent — Control Tower",
+    page_title="Level 3 TMS Agent — Control Tower",
     layout="wide"
 )
 
@@ -369,6 +369,16 @@ def main():
         st.divider()
         st.header("Agent Memory")
         st.text_area("Recent Experiences", agent.memory.get_formatted_summary(), height=200, disabled=True)
+
+        st.divider()
+        st.header("Debug Info")
+        # Check if the secret is loaded and display status
+        if st.secrets.get("GOOGLE_API_KEY"):
+            st.sidebar.success("GOOGLE_API_KEY found in secrets!")
+        else:
+            st.sidebar.error("GOOGLE_API_KEY not found in secrets.")
+        st.sidebar.write("Agent Is Intelligent:", st.session_state.get("is_llm_configured", False))
+
 
     # --- Main Display ---
     st.header("Network Status")
