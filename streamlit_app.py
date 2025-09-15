@@ -157,15 +157,23 @@ class TMSAgent:
         self.tool_functions = AVAILABLE_FUNCTIONS
 
         if 'gemini_model' not in st.session_state:
-            api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            # Prioritize key from user input in session state, then secrets, then environment
+            api_key = st.session_state.get("google_api_key") or st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if api_key and genai:
-                genai.configure(api_key=api_key)
-                st.session_state.gemini_model = genai.GenerativeModel(
-                    'gemini-1.5-pro-latest',
-                    system_instruction="You are a world-class supply chain analyst agent. Your goal is to manage a transportation network to minimize costs while maintaining a high service level. Use the provided tools to gather information and make informed decisions. Think step-by-step. First, analyze the situation. Second, use tools if necessary. Third, propose a concrete action from the given candidates. Respond in JSON format.",
-                )
+                try:
+                    genai.configure(api_key=api_key)
+                    st.session_state.gemini_model = genai.GenerativeModel(
+                        'gemini-1.5-pro-latest',
+                        system_instruction="You are a world-class supply chain analyst agent. Your goal is to manage a transportation network to minimize costs while maintaining a high service level. Use the provided tools to gather information and make informed decisions. Think step-by-step. First, analyze the situation. Second, use tools if necessary. Third, propose a concrete action from the given candidates. Respond in JSON format.",
+                    )
+                    st.session_state.is_llm_configured = True
+                except Exception as e:
+                    st.error(f"Failed to configure Gemini: {e}")
+                    st.session_state.gemini_model = None
+                    st.session_state.is_llm_configured = False
             else:
                 st.session_state.gemini_model = None
+                st.session_state.is_llm_configured = False
     
     def _calculate_kpis(self, result: dict) -> dict:
         if not result or not result.get("ok"):
@@ -180,8 +188,8 @@ class TMSAgent:
 
     def _get_llm_response(self, prompt: str, use_tools=True) -> Dict:
         """Gets a response from the Gemini model, optionally using tools."""
-        if not st.session_state.gemini_model or not Part:
-            return {"decision": {"type": "no_op", "reason": "Deterministic fallback: No LLM configured."}}
+        if not st.session_state.get("is_llm_configured") or not Part:
+            return {"decision": {"type": "no_op", "label": "No Action (Fallback)", "reason": "Fallback mode: Gemini AI not configured. Provide API key in sidebar."}}
         
         model = st.session_state.gemini_model
         generation_config = {"response_mime_type": "application/json"}
@@ -280,8 +288,12 @@ class TMSAgent:
             response_json = self._get_llm_response(prompt)
             decision = response_json.get("decision", candidates[0])
             
+            # Store the agent's reasoning for display in the main UI
+            st.session_state.agent_narrative = decision.get("reason", "No detailed reasoning was provided by the agent.")
+
             status.write("Step 3: Gemini AI has made a decision.")
-            st.write("##### Agent's Decision")
+            # Displaying the raw JSON decision is still useful here for debugging/transparency
+            st.write("##### Agent's Decision (JSON)")
             st.json(decision)
 
             # 3. ACT: Apply the decision and store memory
@@ -332,6 +344,8 @@ def main():
             st.session_state.baseline_kpis = st.session_state.agent._calculate_kpis(st.session_state.baseline)
             st.session_state.current_state = st.session_state.baseline
             st.session_state.current_kpis = st.session_state.baseline_kpis
+            st.session_state.agent_narrative = "The network baseline has been established. The agent is now monitoring for events."
+
 
     model = st.session_state.model
     agent = st.session_state.agent
@@ -339,6 +353,21 @@ def main():
 
     # --- Sidebar ---
     with st.sidebar:
+        st.header("Agent Configuration")
+        api_key_input = st.text_input("Enter your Google API Key", type="password", key="api_key_input")
+        if st.button("Configure Agent"):
+            if api_key_input:
+                st.session_state.google_api_key = api_key_input
+                # Force re-initialization of the agent and its model
+                if 'agent' in st.session_state:
+                    del st.session_state['agent']
+                if 'gemini_model' in st.session_state:
+                    del st.session_state['gemini_model']
+                st.success("API Key set! Agent will now use Gemini.")
+                st.rerun()
+            else:
+                st.warning("Please enter a valid API key.")
+
         st.header("Live Simulation Control")
         if st.button("Simulate Next Event", type="primary"):
             st.session_state.last_event = event_sim.generate_event()
@@ -359,12 +388,24 @@ def main():
     # --- Main Display ---
     st.header("Network Status")
 
+    # Add a persistent warning if the LLM is not configured
+    if not st.session_state.get("is_llm_configured"):
+        st.warning("Warning: Gemini AI is not configured. The agent is running in a deterministic fallback mode. Please enter your Google API key in the sidebar to enable intelligent decision-making.", icon="⚠️")
+
     if 'last_event' in st.session_state and st.session_state.last_event:
         st.info(st.session_state.last_event['description'])
     else:
         st.info("Network is stable. Simulate an event from the sidebar.")
 
+    # New section for Agent's textual analysis
+    st.header("Agent's Analysis")
+    if 'agent_narrative' in st.session_state and st.session_state.agent_narrative:
+        st.markdown(f"> {st.session_state.agent_narrative}")
+    else:
+        st.caption("Awaiting the first event to generate an analysis...")
+
     # KPI Display
+    st.header("KPI Dashboard")
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Baseline KPIs")
