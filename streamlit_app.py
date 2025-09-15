@@ -31,29 +31,47 @@ PALETTE = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
 # ─────────────────────────────────────────────────────────────
 def num(x, default=0.0) -> float:
     try:
-        if x is None: return float(default)
-        v = float(x);  return v if not np.isnan(v) else float(default)
-    except: return float(default)
+        if x is None:
+            return float(default)
+        v = float(x)
+        if np.isnan(v):
+            return float(default)
+        return v
+    except Exception:
+        return float(default)
 
 def fmt(x, none="—", places=2):
-    if x is None: return none
+    if x is None:
+        return none
     try:
-        v = float(x);  return none if np.isnan(v) else f"{v:,.{places}f}"
-    except: return none
+        v = float(x)
+        if np.isnan(v):
+            return none
+        return f"{v:,.{places}f}"
+    except Exception:
+        return none
 
 def pct(x) -> Optional[float]:
     try:
-        if x is None: return None
-        v = float(x);  return None if np.isnan(v) else 100.0*v
-    except: return None
+        if x is None:
+            return None
+        v = float(x)
+        if np.isnan(v):
+            return None
+        return 100.0 * v
+    except Exception:
+        return None
 
 def safe_delta(after, before, none="—", places=2):
     try:
-        if after is None or before is None: return none
-        a,b = float(after), float(before)
-        if np.isnan(a) or np.isnan(b): return none
+        if after is None or before is None:
+            return none
+        a = float(after); b = float(before)
+        if np.isnan(a) or np.isnan(b):
+            return none
         return f"{(a-b):+,.{places}f}"
-    except: return none
+    except Exception:
+        return none
 
 def _norm(s): return str(s).strip().lower()
 
@@ -61,17 +79,19 @@ def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool=False) -> 
     cols = list(df.columns)
     if contains:
         for c in cols:
-            if any(token in _norm(c) for token in candidates): return c
+            if any(token in _norm(c) for token in candidates):
+                return c
     else:
         want = {_norm(c) for c in candidates}
         for c in cols:
-            if _norm(c) in want: return c
+            if _norm(c) in want:
+                return c
     return None
 
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
     R=6371.0
-    dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
+    dlat=radians(lat2-lat1); dlon=radians(lat2-lon1)
     a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     return 2*R*asin(sqrt(a))
 
@@ -114,7 +134,8 @@ def schedule_next_tick():
 # Data loading (AIMMS-like worksheet set)
 # ─────────────────────────────────────────────────────────────
 def load_excel() -> pd.ExcelFile:
-    if os.path.exists(DATA_PATH): return pd.ExcelFile(DATA_PATH)
+    if os.path.exists(DATA_PATH):
+        return pd.ExcelFile(DATA_PATH)
     up = st.file_uploader("Upload base_case.xlsx", type=["xlsx"])
     if up is None:
         st.error("Data file missing. Add `data/base_case.xlsx` or upload here.")
@@ -137,7 +158,8 @@ def read_case() -> dict:
 
     # Customers
     cust_id_col = _find_col(customers_df, ["customer","name","id"])
-    if not cust_id_col: st.error("Customers sheet must contain Customer/Name/ID"); st.stop()
+    if not cust_id_col:
+        st.error("Customers sheet must contain Customer/Name/ID"); st.stop()
     customers = customers_df[cust_id_col].dropna().astype(str).tolist()
 
     # Demand
@@ -191,13 +213,15 @@ def read_case() -> dict:
     def _tpl_row(fr,to):
         if "From Location" in lanes_tpl.columns and "To Location" in lanes_tpl.columns:
             hit = lanes_tpl[(lanes_tpl.get("From Location")==fr) & (lanes_tpl.get("To Location")==to)]
-        else: hit = pd.DataFrame()
+        else:
+            hit = pd.DataFrame()
         if len(hit)>0:
             r=hit.iloc[0].to_dict()
             return {"cpd": float(r.get("Cost per Distance",1.0) or 1.0),
                     "cpu": float(r.get("Cost Per UOM",0.0) or 0.0)}
         return {"cpd": 1.0 if fr=="FG" else 2.0, "cpu": 5.0 if fr=="FG" else 10.0}
-    tpl_fg_dc = _tpl_row("FG","DC"); tpl_dc_ct = _tpl_row("DC","City")
+    tpl_fg_dc = _tpl_row("FG","DC")
+    tpl_dc_ct = _tpl_row("DC","City")
 
     # Nodes
     nodes=[]
@@ -212,17 +236,21 @@ def read_case() -> dict:
 
     # Lanes
     def d_latlon(a,b):
-        if a not in coord or b not in coord: return None
+        if a not in coord or b not in coord:
+            return None
         return haversine_km(coord[a]["lat"],coord[a]["lon"],coord[b]["lat"],coord[b]["lon"])
 
     lanes=[]
     # FG->DC
     for s in FG:
-        if s not in coord: continue
+        if s not in coord: 
+            continue
         for d in warehouses:
-            if d not in coord: continue
+            if d not in coord:
+                continue
             dist=d_latlon(s,d)
-            if dist is None: continue
+            if dist is None:
+                continue
             for p in products:
                 sup_p=float(supply[(supply["supplier"]==s)&(supply["product"]==p)]["supply"].sum())
                 cap=max(0.0, sup_p)        # cap = available supply for that (s,p)
@@ -230,11 +258,14 @@ def read_case() -> dict:
                 lanes.append({"src":s,"dst":d,"product":p,"capacity":cap,"cost_per_unit":cost})
     # DC->City
     for d in warehouses:
-        if d not in coord: continue
+        if d not in coord:
+            continue
         for cst in customers:
-            if cst not in coord: continue
+            if cst not in coord:
+                continue
             dist=d_latlon(d,cst)
-            if dist is None: continue
+            if dist is None:
+                continue
             for p in products:
                 dem_p=float(demand[(demand["customer"]==cst)&(demand["product"]==p)]["demand"].sum())
                 cap=(dem_p*2.0)+1e6
@@ -258,7 +289,8 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
         t = shock.get("type")
         if t == "lane_cap":
             cond = (lanes_df["src"]==shock["src"]) & (lanes_df["dst"]==shock["dst"])
-            if shock.get("product") is not None: cond &= (lanes_df["product"]==shock["product"])
+            if shock.get("product") is not None:
+                cond &= (lanes_df["product"]==shock["product"])
             lanes_df.loc[cond,"capacity"]=float(shock["new_capacity"])
         elif t == "demand_spike":
             cond = (demand_df["customer"]==shock["customer"])
@@ -282,17 +314,20 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     BIGM=1e6
     c=np.zeros(n_vars)
     for (src,dst,pr),i in vidx.items():
-        row=next(r for r in lanes if r["src"]==src and r["dst"]==dst and r["product"]==pr)
+        row = next(r for r in lanes if r["src"]==src and r["dst"]==dst and r["product"]==pr)
         c[i]=float(row["cost_per_unit"])
-    for _,i in sp_index.items(): c[i]=BIGM
-    for _,i in sh_index.items(): c[i]=BIGM
+    for _,i in sp_index.items():
+        c[i]=BIGM
+    for _,i in sh_index.items():
+        c[i]=BIGM
 
     A_eq=[]; b_eq=[]
     # Supply: sum out + disposal = supply
     for s,p in supp_prod:
         row=np.zeros(n_vars)
         for (src,dst,pr),i in vidx.items():
-            if src==s and pr==p: row[i]=1.0
+            if src==s and pr==p:
+                row[i]=1.0
         row[sp_index[(s,p)]]=1.0
         sup_val=float(supply_df[(supply_df["supplier"]==s)&(supply_df["product"]==p)]["supply"].sum())
         A_eq.append(row); b_eq.append(sup_val)
@@ -301,7 +336,8 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     for cst,p in cust_prod:
         row=np.zeros(n_vars)
         for (src,dst,pr),i in vidx.items():
-            if dst==cst and pr==p: row[i]=1.0
+            if dst==cst and pr==p:
+                row[i]=1.0
         row[sh_index[(cst,p)]]=1.0
         dem_val=float(demand_df[(demand_df["customer"]==cst)&(demand_df["product"]==p)]["demand"].sum())
         A_eq.append(row); b_eq.append(dem_val)
@@ -309,7 +345,8 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     # Capacity: x <= capacity
     A_ub=[]; b_ub=[]
     for (src,dst,pr),i in vidx.items():
-        row=np.zeros(n_vars); row[i]=1.0
+        row=np.zeros(n_vars)
+        row[i]=1.0
         cap=float(next(r for r in lanes if r["src"]==src and r["dst"]==dst and r["product"]==pr)["capacity"])
         A_ub.append(row); b_ub.append(cap)
 
@@ -317,13 +354,21 @@ def solve_min_cost_flow(case: dict, shock: dict | None = None) -> dict:
     res=linprog(c, A_ub=np.array(A_ub) if A_ub else None, b_ub=np.array(b_ub) if A_ub else None,
                 A_eq=np.array(A_eq), b_eq=np.array(b_eq), bounds=bounds, method="highs")
 
-    total_shortage=0.0; total_disposal=0.0; flows=[]; objective=math.inf
+    total_shortage=0.0
+    total_disposal=0.0
+    flows=[]
+    objective=math.inf
+
     if res.success:
         x=res.x
         for (src,dst,pr),i in vidx.items():
-            q=float(x[i]);  if q>1e-6: flows.append({"src":src,"dst":dst,"product":pr,"flow":q})
-        for (s,p),i in sp_index.items(): total_disposal+=float(x[i])
-        for (cst,p),i in sh_index.items(): total_shortage+=float(x[i])
+            q = float(x[i])
+            if q > 1e-6:
+                flows.append({"src":src,"dst":dst,"product":pr,"flow":q})
+        for (s,p),i in sp_index.items():
+            total_disposal += float(x[i])
+        for (cst,p),i in sh_index.items():
+            total_shortage += float(x[i])
         objective=float(res.fun)
 
     # Nodes
@@ -358,7 +403,8 @@ def compute_kpis(case: dict, payload: dict) -> dict:
     total_demand = st.session_state.get("total_demand")
     fill_rate=None
     if total_demand is not None and shortage is not None:
-        denom=max(1e-9,float(total_demand)); fill_rate=max(0.0,min(1.0,1.0-float(shortage)/denom))
+        denom=max(1e-9,float(total_demand))
+        fill_rate=max(0.0,min(1.0,1.0-float(shortage)/denom))
     return {"total_cost":cost,"total_flow_units":total_flow,"lanes_used":lanes_used,"avg_cost_per_unit":avg_cpu,
             "shortage_units":shortage,"fill_rate":fill_rate,"disposal_units":disposal,
             "currency": payload.get("currency","EUR"), "flow_unit": payload.get("flow_unit","units")}
@@ -395,9 +441,11 @@ def headline_one_liner(title: str, k_now: dict, k_prev: Optional[dict]) -> str:
             delta_fill = (fill - k_prev["fill_rate"]) * 100.0
     driver = title.split("—")[-1].strip() if "—" in title else title
     parts = [f"**{title}** complete:"]
-    if delta_cost is not None: parts.append(f"{'↑' if delta_cost>0 else '↓'} cost {fmt(abs(delta_cost))} vs reference;")
+    if delta_cost is not None:
+        parts.append(f"{'↑' if delta_cost>0 else '↓'} cost {fmt(abs(delta_cost))} vs reference;")
     parts.append(cost_txt + ",")
-    if delta_fill is not None: parts.append(f"{'↑' if delta_fill>0 else '↓'} fill {fmt(abs(delta_fill),places=1)} pp;")
+    if delta_fill is not None:
+        parts.append(f"{'↑' if delta_fill>0 else '↓'} fill {fmt(abs(delta_fill),places=1)} pp;")
     parts.append(fill_txt + ".")
     parts.append(f" Driver: *{driver}*.")
     return " ".join(parts)
@@ -428,7 +476,8 @@ def deterministic_explanation(idx: int, payload: dict) -> str:
 
 def gemini_explain(idx: int, payload: dict) -> str:
     api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key or genai is None: return deterministic_explanation(idx, payload)
+    if not api_key or genai is None:
+        return deterministic_explanation(idx, payload)
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(st.session_state.get("gem_model","gemini-1.5-pro"),
@@ -462,7 +511,8 @@ def ensure_explanation(idx: int, payload: dict):
 def _center_latlon(nodes: List[Dict]) -> Tuple[float,float]:
     lats=[n.get("lat") for n in nodes if n.get("lat") is not None]
     lons=[n.get("lon") for n in nodes if n.get("lon") is not None]
-    if not lats or not lons: return (20.5937,78.9629)
+    if not lats or not lons:
+        return (20.5937,78.9629)
     return (sum(lats)/len(lats), sum(lons)/len(lons))
 
 def _product_color_map(products: List[str]) -> Dict[str,str]:
@@ -473,10 +523,14 @@ def _node_by_id(nodes: List[Dict]) -> Dict[str,Dict]:
 
 def _flow_weight_scaler(flows: List[Dict], min_w=0.6, max_w=2.0):
     vals=sorted(float(f.get("flow",0.0)) for f in flows if f.get("flow",0.0)>0)
-    if not vals: return lambda q: min_w
-    p90=vals[min(int(0.9*(len(vals)-1)), len(vals)-1)] or (max(vals) if vals else 1.0)
+    if not vals:
+        return lambda q: min_w
+    p90=vals[min(int(0.9*(len(vals)-1)), len(vals)-1)]
+    if not p90:
+        p90 = max(vals) if vals else 1.0
     def to_w(q):
-        if q<=0: return 0.0
+        if q<=0:
+            return 0.0
         w=min_w + (max_w-min_w)*(q/(p90*1.0))
         return max(min_w, min(max_w, w))
     return to_w
@@ -487,7 +541,8 @@ def build_map(nodes: List[Dict], flows: List[Dict], products: List[str], key_suf
     m=folium.Map(location=[lat0,lon0], zoom_start=5, tiles="cartodbpositron")
     # nodes
     for n in nodes:
-        if n.get("lat") is None or n.get("lon") is None: continue
+        if n.get("lat") is None or n.get("lon") is None:
+            continue
         kind=n.get("kind","")
         color="#198754" if kind not in ("supplier","dc") else ("#6f42c1" if kind=="supplier" else "#0d6efd")
         radius=6 if kind in ("supplier","dc") else 5
@@ -497,26 +552,35 @@ def build_map(nodes: List[Dict], flows: List[Dict], products: List[str], key_suf
     # flows
     to_w=_flow_weight_scaler(flows); color_by=_product_color_map(products)
     for f in flows:
-        q=float(f.get("flow",0));  if q<=0: continue
-        u,v=f["src"],f["dst"]; urec,vrec=node_by_id.get(u),node_by_id.get(v)
-        if not urec or not vrec: continue
-        if None in (urec.get("lat"),urec.get("lon"),vrec.get("lat"),vrec.get("lon")): continue
+        q=float(f.get("flow",0))
+        if q<=0:
+            continue
+        u=f["src"]; v=f["dst"]
+        urec=node_by_id.get(u); vrec=node_by_id.get(v)
+        if not urec or not vrec:
+            continue
+        if None in (urec.get("lat"),urec.get("lon"),vrec.get("lat"),vrec.get("lon")):
+            continue
         folium.PolyLine([(urec["lat"],urec["lon"]),(vrec["lat"],vrec["lon"])],
                         weight=to_w(q), color=color_by.get(f.get("product",""),"#555"),
                         opacity=0.55, tooltip=f"{u} → {v} | {f.get('product','')}: {q:,.2f}").add_to(m)
     return m
 
 def show_flows_table(flows: list[dict], caption="Solved flows"):
-    if not flows: st.info("No flows to display."); return
+    if not flows:
+        st.info("No flows to display.")
+        return
     df=pd.DataFrame(flows).sort_values(["src","dst","product"])
-    st.dataframe(df, use_container_width=True, height=300); st.caption(caption)
+    st.dataframe(df, use_container_width=True, height=300)
+    st.caption(caption)
 
 # ─────────────────────────────────────────────────────────────
 # Incidents planner (agent)
 # ─────────────────────────────────────────────────────────────
 def pick_top_lane(payload: dict) -> Optional[dict]:
     flows = payload.get("flows_after") or payload.get("flows") or []
-    if not flows: return None
+    if not flows:
+        return None
     return sorted(flows, key=lambda x: x["flow"], reverse=True)[0]
 
 def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
@@ -551,8 +615,10 @@ def plan_incident_action(iid: int, case: dict, prev: dict) -> dict:
                                         generation_config={"temperature":float(st.session_state.get("gem_temperature",0.1)),
                                                            "max_output_tokens":128})
             j=None
-            try: j=json.loads((resp.text or "").strip())
-            except: j=None
+            try:
+                j=json.loads((resp.text or "").strip())
+            except Exception:
+                j=None
             if j and isinstance(j.get("index"),int) and 0<=j["index"]<len(candidates):
                 choice=candidates[j["index"]]
             else:
@@ -597,9 +663,11 @@ def wrap_payload(payload_after: dict, title: str, before_cost: Optional[float]) 
 # ─────────────────────────────────────────────────────────────
 def start_incident(iid: int):
     if st.session_state["is_running"]:
-        st.warning("Another scenario is running. Please wait."); return
+        st.warning("Another scenario is running. Please wait.")
+        return
     if not st.session_state.get("base"):
-        st.warning("Initialize baseline first."); return
+        st.warning("Initialize baseline first.")
+        return
     labels={1:"Incident 1 — Corridor capacity restriction",
             2:"Incident 2 — Demand surge (+25%)",
             3:"Incident 3 — Strategic express lane"}
@@ -615,27 +683,35 @@ def start_incident(iid: int):
     log(iid,"Started. Agent is analyzing network KPIs and bottlenecks.")
 
 def advance_agent():
-    if not st.session_state["is_running"]: return
-    if st.session_state["next_tick_at"] is None or time.time()<st.session_state["next_tick_at"]: return
-    iid=st.session_state["current_incident"]["id"]; phase=st.session_state["phase"]
+    if not st.session_state["is_running"]:
+        return
+    if st.session_state["next_tick_at"] is None or time.time()<st.session_state["next_tick_at"]:
+        return
+    iid=st.session_state["current_incident"]["id"]
+    phase=st.session_state["phase"]
 
     # THINKING
     if phase=="thinking":
-        st.session_state["tick_count"]+=1; st.session_state["progress_done"]+=1
+        st.session_state["tick_count"]+=1
+        st.session_state["progress_done"]+=1
         msg={1:"Scanning top corridors and DC headroom…",
              2:"Estimating re-route costs and service risk…",
              3:"Evaluating candidate interventions…",}.get(st.session_state["tick_count"],"Analyzing…")
         log(iid,msg)
         if st.session_state["tick_count"]>=THINK_TICKS:
-            st.session_state["phase"]="acting"; st.session_state["acting_stage"]="plan"
-        schedule_next_tick(); return
+            st.session_state["phase"]="acting"
+            st.session_state["acting_stage"]="plan"
+        schedule_next_tick()
+        return
 
     # ACTING — plan
     if phase=="acting" and st.session_state["acting_stage"]=="plan":
         case=st.session_state["case"]
         prev = st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
-        if iid==2: prev=st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
-        if iid==3: prev=st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+        if iid==2:
+            prev=st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
+        if iid==3:
+            prev=st.session_state["payloads"]["2"] or st.session_state["payloads"]["1"] or st.session_state["payloads"]["0"]
         if not prev:
             prev=wrap_payload(st.session_state["base"],"Baseline",st.session_state["base"].get("objective_cost"))
         plan=plan_incident_action(iid,case,prev)
@@ -643,14 +719,16 @@ def advance_agent():
         log(iid, f"Decision taken: {plan.get('reason','Selected action.')}")
         st.session_state["acting_stage"]="apply"
         st.session_state["progress_done"]+=1
-        schedule_next_tick(); return
+        schedule_next_tick()
+        return
 
     # ACTING — apply
     if phase=="acting" and st.session_state["acting_stage"]=="apply":
         case=st.session_state["case"]
         cached=st.session_state["plan_cache"] or {}
         prev=cached.get("prev",{})
-        plan=cached.get("plan",{}); shock=(plan or {}).get("action",{})
+        plan=cached.get("plan",{})
+        shock=(plan or {}).get("action",{})
         after=solve_min_cost_flow(case, shock)
         payload={"title":st.session_state["current_incident"]["label"],
                  "objective_before": prev.get("objective_after"),
@@ -664,14 +742,18 @@ def advance_agent():
                  "customer": shock.get("customer") if shock.get("type")=="demand_spike" else None}
         st.session_state["payloads"][str(iid)]=payload
 
-        base_nodes=st.session_state["base"]["nodes"]; base_products=st.session_state["base"]["products"]
+        base_nodes=st.session_state["base"]["nodes"]
+        base_products=st.session_state["base"]["products"]
         st.session_state["maps"][str(iid)]=build_map(base_nodes, payload.get("flows_after", []), base_products, key_suffix=f"i{iid}")
 
         ensure_explanation(iid,payload)
         log(iid,"Intervention executed. Summarizing results…")
-        st.session_state["phase"]="evaluating"; st.session_state["acting_stage"]=None
-        st.session_state["plan_cache"]=None; st.session_state["progress_done"]+=1
-        schedule_next_tick(); return
+        st.session_state["phase"]="evaluating"
+        st.session_state["acting_stage"]=None
+        st.session_state["plan_cache"]=None
+        st.session_state["progress_done"]+=1
+        schedule_next_tick()
+        return
 
     # EVALUATING
     if phase=="evaluating":
@@ -697,7 +779,8 @@ with st.sidebar:
     for idx, tab in enumerate(tabs, start=1):
         with tab:
             logs=st.session_state["logs"].get(str(idx),[])
-            if not logs: st.caption("No logs yet.")
+            if not logs:
+                st.caption("No logs yet.")
             else:
                 for e in logs[-100:]:
                     st.write(f"**{e['t']}** — {e['msg']}")
@@ -714,15 +797,18 @@ with c1:
     if st.button("🚀 Initialize baseline", disabled=st.session_state["is_running"]):
         case = read_case()
         base = solve_min_cost_flow(case, None)
-        st.session_state["case"]=case; st.session_state["base"]=base
+        st.session_state["case"]=case
+        st.session_state["base"]=base
         base_obj=base.get("objective_cost")
         st.session_state["payloads"]["0"]={"title":"Baseline","objective_before":base_obj,"objective_after":base_obj,
                                            "flows_after":base.get("flows",[]),"currency":base.get("currency"),
                                            "flow_unit":base.get("flow_unit")}
         st.session_state["maps"]["0"]=build_map(base.get("nodes",[]), base.get("flows",[]), base.get("products",[]), key_suffix="base")
         st.session_state["phase"]="baseline_ready"
-        if base.get("ok"): st.success(f"Baseline ready. Total transport cost {fmt(base_obj)}.")
-        else: st.warning("Baseline infeasible. You can still run scenarios.")
+        if base.get("ok"):
+            st.success(f"Baseline ready. Total transport cost {fmt(base_obj)}.")
+        else:
+            st.warning("Baseline infeasible. You can still run scenarios.")
 
 with c2:
     st.button("▶️ Start Incident 1", key="btn_i1",
@@ -755,20 +841,28 @@ def get_payload_by_label(lbl: str) -> Optional[dict]:
 with agent:
     ph=st.session_state["phase"]
     if ph=="baseline_ready" and st.session_state["payloads"]["0"]:
-        p=st.session_state["payloads"]["0"]; k=compute_kpis(st.session_state["case"], p)
+        p=st.session_state["payloads"]["0"]
+        k=compute_kpis(st.session_state["case"], p)
         st.write(f"**Agent**: Baseline ready: total transport cost **{fmt(k['total_cost'])}**, "
                  f"service fill rate **{fmt(pct(k.get('fill_rate')),places=1)}%**. "
                  "This is our starting point to monitor cost and service.")
         st.markdown(kpi_explanation_md(k,"Baseline"))
 
     elif st.session_state["current_incident"] and st.session_state["is_running"]:
-        iid=st.session_state["current_incident"]["id"]; label=st.session_state["current_incident"]["label"]
+        iid=st.session_state["current_incident"]["id"]
+        label=st.session_state["current_incident"]["label"]
         tick=st.session_state["tick_count"]
-        if ph=="thinking": msg={0:f"{label}: Starting analysis…",1:"Analyzing corridor utilization and DC buffers…",
-                                2:"Comparing re-route options and cost deltas…",3:"Selecting the best intervention…",}.get(tick,"Analyzing…")
-        elif ph=="acting" and st.session_state["acting_stage"]=="plan": msg="Committing to selected intervention…"
-        elif ph=="acting" and st.session_state["acting_stage"]=="apply": msg="Applying intervention to network model…"
-        else: msg="Summarizing results…"
+        if ph=="thinking":
+            msg={0:f"{label}: Starting analysis…",
+                 1:"Analyzing corridor utilization and DC buffers…",
+                 2:"Comparing re-route options and cost deltas…",
+                 3:"Selecting the best intervention…",}.get(tick,"Analyzing…")
+        elif ph=="acting" and st.session_state["acting_stage"]=="plan":
+            msg="Committing to selected intervention…"
+        elif ph=="acting" and st.session_state["acting_stage"]=="apply":
+            msg="Applying intervention to network model…"
+        else:
+            msg="Summarizing results…"
         st.write(f"**Agent**: {msg}")
         done=int(st.session_state.get("progress_done",0))
         total=max(1,int(st.session_state.get("progress_total",THINK_TICKS+3)))
@@ -800,10 +894,11 @@ if st.session_state.get("base"):
 # Incident sections
 for iid in (1,2,3):
     payload=st.session_state["payloads"].get(str(iid))
-    if not payload: continue
+    if not payload:
+        continue
     st.divider()
     st.subheader(payload.get("title", f"Incident {iid}"))
-    before,after=payload.get("objective_before"), payload.get("objective_after")
+    before=payload.get("objective_before"); after=payload.get("objective_after")
     ref_payload=get_payload_by_label(ref_label) or st.session_state["payloads"]["0"]
     ref_cost=ref_payload.get("objective_after") if ref_payload else None
     c1,c2,c3,c4=st.columns(4)
@@ -812,10 +907,13 @@ for iid in (1,2,3):
     c3.metric(f"Δ vs {ref_label}", safe_delta(after,ref_cost))
     c4.metric("Used slacks?", "Yes" if payload.get("used_slacks") else "No")
     if payload.get("lane"):
-        l=payload["lane"]; tag=f"{l.get('src','?')} → {l.get('dst','?')}"
-        if "cost_per_unit" in l: tag+=f" @ {fmt(l['cost_per_unit'])}"
+        l=payload["lane"]
+        tag=f"{l.get('src','?')} → {l.get('dst','?')}"
+        if "cost_per_unit" in l:
+            tag+=f" @ {fmt(l['cost_per_unit'])}"
         st.caption(f"Lane changed: {tag}")
-    if payload.get("customer"): st.caption(f"Customer impacted: {payload['customer']}")
+    if payload.get("customer"):
+        st.caption(f"Customer impacted: {payload['customer']}")
     with st.container(border=True):
         st.markdown(f"**Network Map ({payload.get('title','Incident')})**")
         st_folium(st.session_state["maps"].get(str(iid)), width=None, height=520, key=f"map_i{iid}")
