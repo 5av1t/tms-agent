@@ -167,10 +167,12 @@ class TMSAgent:
                         system_instruction="You are a world-class supply chain analyst agent. Your goal is to manage a transportation network to minimize costs while maintaining a high service level. Use the provided tools to gather information and make informed decisions. Think step-by-step. First, analyze the situation. Second, use tools if necessary. Third, propose a concrete action from the given candidates. Respond in JSON format.",
                     )
                     st.session_state.is_llm_configured = True
+                    st.session_state.gemini_init_error = None # Clear any previous error on success
                 except Exception as e:
                     st.error(f"Failed to configure Gemini: {e}")
                     st.session_state.gemini_model = None
                     st.session_state.is_llm_configured = False
+                    st.session_state.gemini_init_error = str(e) # Store the error message
             else:
                 st.session_state.gemini_model = None
                 st.session_state.is_llm_configured = False
@@ -377,7 +379,14 @@ def main():
             st.sidebar.success("GOOGLE_API_KEY found in secrets!")
         else:
             st.sidebar.error("GOOGLE_API_KEY not found in secrets.")
+        
         st.sidebar.write("Agent Is Intelligent:", st.session_state.get("is_llm_configured", False))
+
+        # New: Display the initialization error if it exists
+        init_error = st.session_state.get("gemini_init_error")
+        if init_error:
+            st.sidebar.error("Gemini Initialization Failed:")
+            st.sidebar.caption(init_error)
 
 
     # --- Main Display ---
