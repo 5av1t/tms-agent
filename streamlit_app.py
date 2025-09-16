@@ -7,10 +7,33 @@ import os
 from typing import Dict, List, Optional
 import folium
 from streamlit_folium import st_folium
+import traceback # Added for detailed error logging
 
-# Project imports
-from solver import SupplyChainModel
-from tools import get_available_tools, AVAILABLE_FUNCTIONS
+# Project imports - Assuming these files exist in the same directory
+# You will need to provide the 'solver.py' and 'tools.py' files for this to run.
+# Creating placeholder classes if files are not found.
+try:
+    from solver import SupplyChainModel
+except ImportError:
+    st.error("Could not import `SupplyChainModel` from `solver.py`. Please ensure the file exists.")
+    class SupplyChainModel:
+        def __init__(self, data_path):
+            st.warning("Using a placeholder `SupplyChainModel`. Functionality will be limited.")
+            self.case = {
+                'nodes': pd.DataFrame([{'id': 'dummy', 'kind': 'customer', 'lat': 28.6139, 'lon': 77.2090}]),
+                'lanes': pd.DataFrame(),
+                'demand': pd.DataFrame(columns=['demand'])
+            }
+        def solve(self, shock=None):
+            return {"ok": False} # Default to not okay
+
+try:
+    from tools import get_available_tools, AVAILABLE_FUNCTIONS
+except ImportError:
+    st.error("Could not import `get_available_tools` and `AVAILABLE_FUNCTIONS` from `tools.py`. Please ensure the file exists.")
+    def get_available_tools(): return []
+    AVAILABLE_FUNCTIONS = {}
+
 
 # Optional Gemini
 try:
@@ -168,14 +191,24 @@ class TMSAgent:
                     )
                     st.session_state.is_llm_configured = True
                     st.session_state.gemini_init_error = None # Clear any previous error on success
+                    st.session_state.gemini_init_traceback = None # Clear traceback
                 except Exception as e:
-                    st.error(f"Failed to configure Gemini: {e}")
+                    # Enhanced error logging: This will display the full exception in the app's main body
+                    st.error("Gemini configuration failed. See details below and in the sidebar.")
+                    st.exception(e)
+
+                    # Store error details for the sidebar
                     st.session_state.gemini_model = None
                     st.session_state.is_llm_configured = False
                     st.session_state.gemini_init_error = str(e) # Store the error message
+                    st.session_state.gemini_init_traceback = traceback.format_exc()
             else:
                 st.session_state.gemini_model = None
                 st.session_state.is_llm_configured = False
+                if not genai:
+                    st.session_state.gemini_init_error = "GenAI library not found. Have you added 'google-generativeai' to requirements.txt?"
+                elif not api_key:
+                     st.session_state.gemini_init_error = "API Key not found. Ensure GOOGLE_API_KEY is in Streamlit secrets."
     
     def _calculate_kpis(self, result: dict) -> dict:
         if not result or not result.get("ok"):
@@ -183,9 +216,9 @@ class TMSAgent:
         total_demand = self.model.case['demand']['demand'].sum()
         if total_demand == 0: total_demand = 1 # Avoid division by zero
         return {
-            "cost": result["objective_cost"],
-            "fill_rate": 1 - (result["total_shortage"] / total_demand),
-            "flows": result["flows"]
+            "cost": result.get("objective_cost"),
+            "fill_rate": 1 - (result.get("total_shortage", total_demand) / total_demand),
+            "flows": result.get("flows", [])
         }
 
     def _get_llm_response(self, prompt: str, use_tools=True) -> Dict:
@@ -382,11 +415,17 @@ def main():
         
         st.sidebar.write("Agent Is Intelligent:", st.session_state.get("is_llm_configured", False))
 
-        # New: Display the initialization error if it exists
+        # Enhanced error display
         init_error = st.session_state.get("gemini_init_error")
+        init_traceback = st.session_state.get("gemini_init_traceback")
+
         if init_error:
             st.sidebar.error("Gemini Initialization Failed:")
             st.sidebar.caption(init_error)
+
+        if init_traceback:
+            with st.sidebar.expander("Show Full Error Traceback"):
+                st.code(init_traceback)
 
 
     # --- Main Display ---
@@ -422,7 +461,12 @@ def main():
     st.header("Network Flow Visualization")
     map_data = st.session_state.current_state
     if map_data and map_data.get('ok'):
-        folium_map = draw_map(map_data['nodes'], map_data['flows'], map_data['products'])
+        # Assuming 'nodes', 'flows', and 'products' are available in map_data
+        nodes = map_data.get('nodes', [])
+        flows = map_data.get('flows', [])
+        products = map_data.get('products', [])
+        
+        folium_map = draw_map(nodes, flows, products)
         st_folium(folium_map, width=None, height=500)
         
         with st.expander("Show Current Flow Data"):
