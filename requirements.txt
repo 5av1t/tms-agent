@@ -3,5 +3,5 @@ pandas
 pulp
 folium
 streamlit-folium
-google-generativeai
+google-genai
 openpyxl
